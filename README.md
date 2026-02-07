@@ -15,6 +15,6 @@ More features may come in the future.
 
 Usage
 
-- `/panshot panorama`
+- `/panshot panorama start every 5`
 
-- `/panshot single`
+- `/panshot single every 5`
