@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PanShot Single Preview</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --panel-bg: rgba(18, 20, 28, 0.82);
+      --panel-border: rgba(255, 255, 255, 0.2);
+      --text: #f4f7ff;
+      --muted: #b1bdd4;
+      --accent: #55b7ff;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #0b0e16;
+      color: var(--text);
+      font-family: "Segoe UI", Tahoma, sans-serif;
+    }
+    #previewCanvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      cursor: grab;
+      z-index: 0;
+    }
+    #previewCanvas.dragging {
+      cursor: grabbing;
+    }
+    .panel {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: min(460px, calc(100vw - 24px));
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--panel-border);
+      background: var(--panel-bg);
+      backdrop-filter: blur(6px);
+      z-index: 2;
+    }
+    .title {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+      letter-spacing: 0.2px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .row:last-child {
+      margin-bottom: 0;
+    }
+    button, input[type="range"] {
+      accent-color: var(--accent);
+    }
+    button {
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: rgba(255, 255, 255, 0.14);
+    }
+    input[type="range"] {
+      width: 150px;
+    }
+    input[type="number"] {
+      width: 88px;
+      padding: 4px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+    }
+    label {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .status {
+      font-size: 12px;
+      line-height: 1.3;
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+<canvas id="previewCanvas"></canvas>
+
+<div class="panel">
+  <h1 class="title">PanShot Single Compare</h1>
+  <div class="row">
+    <button id="loadCompareButton" type="button">Load Compare</button>
+    <button id="clearCompareButton" type="button">Clear Compare</button>
+    <button id="resetViewButton" type="button">Reset View</button>
+    <input id="fileInput" type="file" accept="image/*" hidden>
+  </div>
+  <div class="row">
+    <label for="opacity">Blend</label>
+    <input id="opacity" type="range" min="0" max="100" value="50">
+    <span id="opacityValue" class="hint">50%</span>
+  </div>
+  <div class="row">
+    <label><input id="flipToggle" type="checkbox"> Flip A/B</label>
+    <label><input id="autoFlipToggle" type="checkbox"> Auto flip</label>
+    <label>Ms</label>
+    <input id="autoFlipInterval" type="number" min="100" step="50" value="500">
+    <span id="zoomValue" class="hint">Zoom: 1x</span>
+  </div>
+  <div id="status" class="status">Connecting to single preview stream...</div>
+  <div class="hint">Drag to pan, wheel to zoom. Live stream updates automatically.</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("previewCanvas");
+  const context = canvas.getContext("2d");
+  const loadCompareButton = document.getElementById("loadCompareButton");
+  const clearCompareButton = document.getElementById("clearCompareButton");
+  const resetViewButton = document.getElementById("resetViewButton");
+  const fileInput = document.getElementById("fileInput");
+  const opacityInput = document.getElementById("opacity");
+  const opacityValue = document.getElementById("opacityValue");
+  const flipToggle = document.getElementById("flipToggle");
+  const autoFlipToggle = document.getElementById("autoFlipToggle");
+  const autoFlipIntervalInput = document.getElementById("autoFlipInterval");
+  const zoomValue = document.getElementById("zoomValue");
+  const statusEl = document.getElementById("status");
+
+  let liveBitmap = null;
+  let compareBitmap = null;
+  let lastLiveTimestamp = 0;
+  let liveRequestToken = 0;
+  let lastState = null;
+  let autoFlipTimer = null;
+
+  let centerX = 0;
+  let centerY = 0;
+  let centerInitialized = false;
+  let zoomIndex = 0;
+  let zoom = 1;
+  let dragging = false;
+  let dragAnchorImageX = 0;
+  let dragAnchorImageY = 0;
+  let redrawRequested = false;
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function getCurrentOpacity() {
+    return clamp(Number(opacityInput.value) / 100, 0, 1);
+  }
+
+  function getPrimaryBitmap() {
+    return liveBitmap || compareBitmap;
+  }
+
+  function ensureCenterInitialized() {
+    if (centerInitialized) {
+      return;
+    }
+    const base = getPrimaryBitmap();
+    if (!base) {
+      return;
+    }
+    centerX = base.width * 0.5;
+    centerY = base.height * 0.5;
+    centerInitialized = true;
+  }
+
+  function ensureCanvasSize() {
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(1, Math.floor(window.innerWidth * dpr));
+    const height = Math.max(1, Math.floor(window.innerHeight * dpr));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+  }
+
+  function updateOpacityLabel() {
+    opacityValue.textContent = opacityInput.value + "%";
+  }
+
+  function updateZoomLabel() {
+    zoomValue.textContent = "Zoom: " + zoom + "x";
+  }
+
+  function updateStatusText(errorText) {
+    if (errorText) {
+      statusEl.textContent = "State error: " + errorText;
+      return;
+    }
+
+    const liveSize = liveBitmap ? (liveBitmap.width + "x" + liveBitmap.height) : "none";
+    const compareSize = compareBitmap ? (compareBitmap.width + "x" + compareBitmap.height) : "none";
+    if (!lastState) {
+      statusEl.textContent = "Waiting for single preview state...";
+      return;
+    }
+
+    statusEl.textContent = "Running: "
+      + lastState.running
+      + " | Live available: "
+      + lastState.available
+      + " | Last update: "
+      + lastState.lastModified
+      + " | Live: "
+      + liveSize
+      + " | Compare: "
+      + compareSize;
+  }
+
+  function requestRedraw() {
+    if (redrawRequested) {
+      return;
+    }
+    redrawRequested = true;
+    window.requestAnimationFrame(redraw);
+  }
+
+  function drawBitmap(bitmap, alpha) {
+    if (!bitmap) {
+      return;
+    }
+    context.globalAlpha = alpha;
+    context.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height);
+  }
+
+  function redraw() {
+    redrawRequested = false;
+    ensureCanvasSize();
+
+    context.imageSmoothingEnabled = false;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.fillStyle = "#0b0e16";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    const hasAnyImage = !!liveBitmap || !!compareBitmap;
+    if (!hasAnyImage) {
+      return;
+    }
+
+    ensureCenterInitialized();
+    if (!centerInitialized) {
+      return;
+    }
+
+    context.translate(Math.round(canvas.width * 0.5), Math.round(canvas.height * 0.5));
+    context.scale(zoom, zoom);
+    context.translate(-centerX, -centerY);
+
+    const opacity = getCurrentOpacity();
+    if (liveBitmap && compareBitmap) {
+      if (flipToggle.checked) {
+        drawBitmap(compareBitmap, 1);
+        drawBitmap(liveBitmap, opacity);
+      } else {
+        drawBitmap(liveBitmap, 1);
+        drawBitmap(compareBitmap, opacity);
+      }
+    } else if (liveBitmap) {
+      drawBitmap(liveBitmap, 1);
+    } else {
+      drawBitmap(compareBitmap, 1);
+    }
+
+    context.globalAlpha = 1;
+  }
+
+  function offsetToImageX(offsetX) {
+    const dpr = window.devicePixelRatio || 1;
+    const pixelX = offsetX * dpr;
+    return (pixelX - canvas.width * 0.5) / zoom + centerX;
+  }
+
+  function offsetToImageY(offsetY) {
+    const dpr = window.devicePixelRatio || 1;
+    const pixelY = offsetY * dpr;
+    return (pixelY - canvas.height * 0.5) / zoom + centerY;
+  }
+
+  function setOffsetImagePosition(offsetX, offsetY, imageX, imageY) {
+    const dpr = window.devicePixelRatio || 1;
+    const pixelX = offsetX * dpr;
+    const pixelY = offsetY * dpr;
+    centerX = imageX - (pixelX - canvas.width * 0.5) / zoom;
+    centerY = imageY - (pixelY - canvas.height * 0.5) / zoom;
+  }
+
+  function resetView() {
+    centerInitialized = false;
+    ensureCenterInitialized();
+    zoomIndex = 0;
+    zoom = 1;
+    updateZoomLabel();
+    requestRedraw();
+  }
+
+  function closeBitmap(bitmap) {
+    if (bitmap && typeof bitmap.close === "function") {
+      bitmap.close();
+    }
+  }
+
+  async function loadLiveImage(timestamp) {
+    const token = ++liveRequestToken;
+    const response = await fetch("/live-single.png?ts=" + timestamp, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error("Live image request failed: " + response.status);
+    }
+
+    const blob = await response.blob();
+    const bitmap = await createImageBitmap(blob);
+    if (token !== liveRequestToken) {
+      closeBitmap(bitmap);
+      return;
+    }
+
+    closeBitmap(liveBitmap);
+    liveBitmap = bitmap;
+    if (!centerInitialized) {
+      centerX = liveBitmap.width * 0.5;
+      centerY = liveBitmap.height * 0.5;
+      centerInitialized = true;
+    }
+    updateStatusText(null);
+    requestRedraw();
+  }
+
+  async function pollState() {
+    try {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error("State request failed: " + response.status);
+      }
+
+      const state = await response.json();
+      lastState = state;
+      if (state.available && state.lastModified > 0 && state.lastModified !== lastLiveTimestamp) {
+        lastLiveTimestamp = state.lastModified;
+        await loadLiveImage(lastLiveTimestamp);
+      } else {
+        updateStatusText(null);
+      }
+    } catch (error) {
+      updateStatusText(error.message);
+    }
+    setTimeout(pollState, 1000);
+  }
+
+  function applyAutoFlip() {
+    if (autoFlipTimer !== null) {
+      clearInterval(autoFlipTimer);
+      autoFlipTimer = null;
+    }
+
+    if (!autoFlipToggle.checked) {
+      return;
+    }
+
+    const intervalMs = Math.max(100, Math.round(Number(autoFlipIntervalInput.value) || 500));
+    autoFlipIntervalInput.value = intervalMs;
+    autoFlipTimer = setInterval(() => {
+      flipToggle.checked = !flipToggle.checked;
+      requestRedraw();
+    }, intervalMs);
+  }
+
+  loadCompareButton.addEventListener("click", () => {
+    fileInput.click();
+  });
+
+  clearCompareButton.addEventListener("click", () => {
+    closeBitmap(compareBitmap);
+    compareBitmap = null;
+    updateStatusText(null);
+    requestRedraw();
+  });
+
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files && fileInput.files.length > 0 ? fileInput.files[0] : null;
+    if (!file) {
+      return;
+    }
+
+    try {
+      const bitmap = await createImageBitmap(file);
+      closeBitmap(compareBitmap);
+      compareBitmap = bitmap;
+      if (!centerInitialized) {
+        centerX = compareBitmap.width * 0.5;
+        centerY = compareBitmap.height * 0.5;
+        centerInitialized = true;
+      }
+      updateStatusText(null);
+      requestRedraw();
+    } catch (error) {
+      updateStatusText("Compare image error: " + error.message);
+    } finally {
+      fileInput.value = "";
+    }
+  });
+
+  opacityInput.addEventListener("input", () => {
+    updateOpacityLabel();
+    requestRedraw();
+  });
+
+  flipToggle.addEventListener("change", () => {
+    requestRedraw();
+  });
+
+  autoFlipToggle.addEventListener("change", applyAutoFlip);
+  autoFlipIntervalInput.addEventListener("change", applyAutoFlip);
+
+  resetViewButton.addEventListener("click", resetView);
+
+  canvas.addEventListener("mousedown", event => {
+    if (event.button !== 0) {
+      return;
+    }
+    ensureCenterInitialized();
+    if (!centerInitialized) {
+      return;
+    }
+    dragging = true;
+    dragAnchorImageX = offsetToImageX(event.offsetX);
+    dragAnchorImageY = offsetToImageY(event.offsetY);
+    canvas.classList.add("dragging");
+  });
+
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    canvas.classList.remove("dragging");
+  });
+
+  canvas.addEventListener("mousemove", event => {
+    if (!dragging || !centerInitialized) {
+      return;
+    }
+    setOffsetImagePosition(event.offsetX, event.offsetY, dragAnchorImageX, dragAnchorImageY);
+    requestRedraw();
+  });
+
+  canvas.addEventListener("wheel", event => {
+    event.preventDefault();
+    ensureCenterInitialized();
+    if (!centerInitialized) {
+      return;
+    }
+
+    const anchorImageX = offsetToImageX(event.offsetX);
+    const anchorImageY = offsetToImageY(event.offsetY);
+    const delta = Math.sign(-event.deltaY);
+    if (delta === 0) {
+      return;
+    }
+
+    zoomIndex = clamp(zoomIndex + delta, -6, 6);
+    zoom = Math.pow(2, zoomIndex);
+    setOffsetImagePosition(event.offsetX, event.offsetY, anchorImageX, anchorImageY);
+    updateZoomLabel();
+    requestRedraw();
+  }, { passive: false });
+
+  window.addEventListener("resize", requestRedraw);
+
+  updateOpacityLabel();
+  updateZoomLabel();
+  updateStatusText(null);
+  requestRedraw();
+  pollState();
+})();
+</script>
+</body>
+</html>

@@ -22,6 +22,19 @@ This mod detaches rendering from the local player by swapping `MinecraftClient` 
 - `/panshot panorama export on`: Also write stitched cubemap to `screenshots/panorama_cubemap.png`.
 - `/panshot panorama export off`: Keep cubemap in-memory only (default).
 - `/panshot panorama stop`: Stop periodic panorama capture.
+- `/panshot single`: Start single-direction live preview with default interval (1s) from your current eye position + yaw/pitch.
+- `/panshot single <x> <y> <z> <yaw> <pitch>`: Start single-direction preview from exact decimal coordinates and exact yaw/pitch.
+- `/panshot single every <intervalSeconds>`: Same as `single`, but with custom interval.
+- `/panshot single every <intervalSeconds> <x> <y> <z> <yaw> <pitch>`: Exact coords/orientation with custom interval.
+- `/panshot single resolution`: Show current single-capture resolution.
+- `/panshot single resolution <width> <height>`: Set single-capture resolution (64-4096 per dimension).
+- `/panshot single fov`: Show current single-capture FOV.
+- `/panshot single fov <degrees>`: Set single-capture FOV (1-179).
+- `/panshot single renderplayer`: Show single-player rendering mode (`on`/`off`).
+- `/panshot single renderplayer on`: Render a temporary local-player clone in single captures.
+- `/panshot single renderplayer off`: Disable local-player clone rendering for single captures (default).
+- `/panshot single status`: Show single preview status.
+- `/panshot single stop`: Stop single preview.
 
 Panorama capture details:
 
@@ -44,6 +57,15 @@ Panorama capture details:
 - Default capture mode is `smooth` to reduce gameplay hitching.
 - Optional disk export can be enabled with `/panshot panorama export on`.
 - Runs in the background while you keep playing.
+
+Single preview details:
+
+- Captures one face repeatedly (same fixed yaw/pitch each frame), defaulting to 1024x1024 at 90 degree FOV.
+- Resolution and FOV are configurable via `/panshot single resolution <width> <height>` and `/panshot single fov <degrees>`.
+- Optional local-player rendering can be toggled with `/panshot single renderplayer on|off`.
+- Uses a dedicated localhost viewer URL (separate from panorama viewer).
+- Viewer updates live from internal memory stream (`/live-single.png`) and supports loading a compare image overlay.
+- Panorama and single preview are mutually exclusive (starting one stops the other).
 
 ## Build
 
