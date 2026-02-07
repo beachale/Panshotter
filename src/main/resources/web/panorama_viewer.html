@@ -206,7 +206,11 @@
   let activeLiveContainer = null;
   let standbyLiveContainer = null;
   let pendingSwapViewer = null;
-  let pendingSwapView = null;
+  let pendingSwapContainer = null;
+  let pendingSwapReady = false;
+  let livePointerActive = false;
+  let dragSourceViewer = null;
+  let dragSourceContainer = null;
   let customViewer = null;
   let liveAtlasImage = null;
   let liveAtlasCanvas = null;
@@ -286,6 +290,14 @@
       standbyLiveContainer.style.zIndex = "1";
       standbyLiveContainer.style.pointerEvents = "none";
     }
+    if (livePointerActive && dragSourceContainer) {
+      if (liveContainerA) {
+        liveContainerA.style.pointerEvents = liveContainerA === dragSourceContainer ? "auto" : "none";
+      }
+      if (liveContainerB) {
+        liveContainerB.style.pointerEvents = liveContainerB === dragSourceContainer ? "auto" : "none";
+      }
+    }
   }
 
   function setActiveLiveViewer(viewer, container) {
@@ -305,8 +317,44 @@
     return activeLiveViewer;
   }
 
+  function getContainerForViewer(viewer) {
+    if (viewer === liveViewerA) {
+      return liveContainerA;
+    }
+    if (viewer === liveViewerB) {
+      return liveContainerB;
+    }
+    return null;
+  }
+
+  function clearPendingLiveSwap() {
+    pendingSwapViewer = null;
+    pendingSwapContainer = null;
+    pendingSwapReady = false;
+  }
+
+  function applyPendingLiveSwap() {
+    if (!pendingSwapReady || !pendingSwapViewer || !pendingSwapContainer) {
+      return;
+    }
+
+    const targetViewer = pendingSwapViewer;
+    const targetContainer = pendingSwapContainer;
+    targetViewer.lookAt(getLiveView(), 0);
+    requestAnimationFrame(() => {
+      if (!pendingSwapReady || pendingSwapViewer !== targetViewer || pendingSwapContainer !== targetContainer) {
+        return;
+      }
+      setActiveLiveViewer(targetViewer, targetContainer);
+      clearPendingLiveSwap();
+      liveViewerInitialized = true;
+      syncCustomToLive();
+      updateViewLabel();
+    });
+  }
+
   function getLiveView() {
-    const liveViewer = getActiveLiveViewer();
+    const liveViewer = livePointerActive && dragSourceViewer ? dragSourceViewer : getActiveLiveViewer();
     if (!liveViewer) {
       return { yaw: 0, pitch: 0, fov: 90 };
     }
@@ -457,6 +505,19 @@
       return;
     }
 
+    if (livePointerActive) {
+      if (!standbyLiveViewer || !standbyLiveContainer) {
+        return;
+      }
+      pendingSwapViewer = standbyLiveViewer;
+      pendingSwapContainer = standbyLiveContainer;
+      pendingSwapReady = false;
+      standbyLiveViewer.setImage(image, {
+        projectionType: CUBEMAP_PROJECTION
+      });
+      return;
+    }
+
     if (!standbyLiveViewer) {
       const activeViewer = getActiveLiveViewer();
       if (!activeViewer) {
@@ -472,16 +533,24 @@
     }
 
     pendingSwapViewer = standbyLiveViewer;
-    pendingSwapView = view || getLiveView();
+    pendingSwapContainer = standbyLiveContainer;
+    pendingSwapReady = false;
     standbyLiveViewer.setImage(image, {
       projectionType: CUBEMAP_PROJECTION
     });
   }
 
   function handleLiveViewChange(sourceViewer, event) {
-    if (sourceViewer !== getActiveLiveViewer()) {
+    const activeViewer = getActiveLiveViewer();
+    const isDragSource = livePointerActive && dragSourceViewer && sourceViewer === dragSourceViewer;
+    if (sourceViewer !== activeViewer && !isDragSource) {
       return;
     }
+
+    if (isDragSource && activeViewer && activeViewer !== sourceViewer) {
+      activeViewer.lookAt({ yaw: event.yaw, pitch: event.pitch, fov: event.fov }, 0);
+    }
+
     if (customViewer) {
       customViewer.lookAt({ yaw: event.yaw, pitch: event.pitch, fov: event.fov }, 0);
     }
@@ -492,15 +561,11 @@
 
   function handleLiveViewerReady(sourceViewer, sourceContainer) {
     if (pendingSwapViewer && sourceViewer === pendingSwapViewer) {
-      if (pendingSwapView) {
-        sourceViewer.lookAt(pendingSwapView, 0);
+      pendingSwapContainer = sourceContainer;
+      pendingSwapReady = true;
+      if (!livePointerActive) {
+        applyPendingLiveSwap();
       }
-      setActiveLiveViewer(sourceViewer, sourceContainer);
-      pendingSwapViewer = null;
-      pendingSwapView = null;
-      liveViewerInitialized = true;
-      syncCustomToLive();
-      updateViewLabel();
       return;
     }
 
@@ -770,6 +835,35 @@
   window.addEventListener("resize", () => {
     drawRawAtlas();
   });
+
+  viewerStack.addEventListener("pointerdown", event => {
+    if (rawToggle.checked) {
+      return;
+    }
+    if (event.button !== undefined && event.button !== 0) {
+      return;
+    }
+    livePointerActive = true;
+    clearPendingLiveSwap();
+    dragSourceViewer = getActiveLiveViewer();
+    dragSourceContainer = getContainerForViewer(dragSourceViewer);
+    updateLiveLayerVisibility();
+  }, true);
+
+  function onLivePointerEnd() {
+    if (!livePointerActive) {
+      return;
+    }
+    livePointerActive = false;
+    dragSourceViewer = null;
+    dragSourceContainer = null;
+    updateLiveLayerVisibility();
+    applyPendingLiveSwap();
+  }
+
+  window.addEventListener("pointerup", onLivePointerEnd, true);
+  window.addEventListener("pointercancel", onLivePointerEnd, true);
+  window.addEventListener("blur", onLivePointerEnd);
 
   viewerStack.addEventListener("wheel", event => {
     const liveViewer = getActiveLiveViewer();

@@ -1,6 +1,9 @@
 package com.panshot.spectatorcam;
 
+import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.systems.CommandEncoder;
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
@@ -31,7 +34,11 @@ import net.minecraft.text.ClickEvent;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.Vec3d;
 
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.IntBuffer;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
@@ -39,6 +46,8 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+import javax.imageio.ImageIO;
 
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
@@ -53,6 +62,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static final PanoramaCaptureController PANORAMA_CONTROLLER = new PanoramaCaptureController();
     private static final SingleCaptureController SINGLE_CONTROLLER = new SingleCaptureController();
     private static final SpectatorCameraController CAMERA_CONTROLLER = new SpectatorCameraController();
+    private static final ExecutorService READBACK_CONVERT_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "panshot-readback-convert");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     @Override
     public void onInitializeClient() {
@@ -66,6 +80,150 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
     private static void registerCommands(CommandDispatcher<FabricClientCommandSource> dispatcher) {
         dispatcher.register(buildRootCommand("panshot"));
+    }
+
+    private static void takeScreenshotAsyncFast(MinecraftClient client, Framebuffer framebuffer, Consumer<NativeImage> consumer) {
+        GpuTexture colorAttachment = framebuffer.getColorAttachment();
+        if (colorAttachment == null) {
+            throw new IllegalStateException("Tried to capture screenshot of an incomplete framebuffer");
+        }
+
+        int width = framebuffer.textureWidth;
+        int height = framebuffer.textureHeight;
+        int pixelSize = colorAttachment.getFormat().pixelSize();
+        int pixelCount = width * height;
+        int requiredBytes = pixelCount * pixelSize;
+        GpuBuffer gpuBuffer = RenderSystem.getDevice().createBuffer(() -> "PanShot readback buffer", 9, requiredBytes);
+        CommandEncoder commandEncoder = RenderSystem.getDevice().createCommandEncoder();
+        commandEncoder.copyTextureToBuffer(colorAttachment, gpuBuffer, 0, () -> {
+            GpuBuffer.MappedView mappedView;
+            try {
+                mappedView = commandEncoder.mapBuffer(gpuBuffer, true, false);
+            } catch (RuntimeException exception) {
+                gpuBuffer.close();
+                throw exception;
+            }
+
+            READBACK_CONVERT_EXECUTOR.execute(() -> {
+                NativeImage image = null;
+                RuntimeException failure = null;
+                try {
+                    int[] readbackPixels = new int[pixelCount];
+                    IntBuffer intBuffer = mappedView.data().asIntBuffer();
+                    intBuffer.get(readbackPixels, 0, pixelCount);
+
+                    image = new NativeImage(width, height, false);
+                    for (int y = 0; y < height; y++) {
+                        int srcRow = y * width;
+                        int dstY = height - y - 1;
+                        for (int x = 0; x < width; x++) {
+                            image.setColor(x, dstY, readbackPixels[srcRow + x] | 0xFF000000);
+                        }
+                    }
+                } catch (RuntimeException exception) {
+                    failure = exception;
+                }
+                NativeImage completedImage = image;
+                RuntimeException capturedFailure = failure;
+                client.execute(() -> {
+                    RuntimeException unmapFailure = null;
+                    try {
+                        mappedView.close();
+                    } catch (RuntimeException exception) {
+                        unmapFailure = exception;
+                    } finally {
+                        gpuBuffer.close();
+                    }
+
+                    if (unmapFailure != null) {
+                        if (completedImage != null) {
+                            completedImage.close();
+                        }
+                        unmapFailure.printStackTrace();
+                        ScreenshotRecorder.takeScreenshot(framebuffer, consumer);
+                        return;
+                    }
+
+                    if (completedImage != null) {
+                        consumer.accept(completedImage);
+                    } else {
+                        if (capturedFailure != null) {
+                            capturedFailure.printStackTrace();
+                        }
+                        ScreenshotRecorder.takeScreenshot(framebuffer, consumer);
+                    }
+                });
+            });
+        }, 0);
+    }
+
+    private static OtherClientPlayerEntity createRenderPlayerEntity(
+        ClientWorld world,
+        UUID profileId,
+        int entityId,
+        ClientPlayerEntity sourcePlayer
+    ) {
+        GameProfile sourceProfile = sourcePlayer.getGameProfile();
+        GameProfile renderProfile = new GameProfile(profileId, sourceProfile.name(), sourceProfile.properties());
+        OtherClientPlayerEntity renderPlayer = new OtherClientPlayerEntity(world, renderProfile);
+        renderPlayer.setId(entityId);
+        return renderPlayer;
+    }
+
+    private static void syncRenderPlayerEntityState(ClientPlayerEntity source, OtherClientPlayerEntity target) {
+        target.refreshPositionAndAngles(source.getX(), source.getY(), source.getZ(), source.getYaw(), source.getPitch());
+        target.setYaw(source.getYaw());
+        target.setPitch(source.getPitch());
+        target.lastYaw = source.lastYaw;
+        target.lastPitch = source.lastPitch;
+        target.lastX = source.lastX;
+        target.lastY = source.lastY;
+        target.lastZ = source.lastZ;
+        target.setVelocity(source.getVelocity());
+        target.setOnGround(source.isOnGround());
+        target.setSneaking(source.isSneaking());
+        target.setSprinting(source.isSprinting());
+        target.setSwimming(source.isSwimming());
+        target.setPose(source.getPose());
+        target.setHeadYaw(source.getHeadYaw());
+        target.setBodyYaw(source.getBodyYaw());
+        target.lastHeadYaw = source.lastHeadYaw;
+        target.lastBodyYaw = source.lastBodyYaw;
+        target.setInvisible(source.isInvisible());
+        for (EquipmentSlot slot : EquipmentSlot.values()) {
+            target.equipStack(slot, source.getEquippedStack(slot));
+        }
+        if (source.isUsingItem()) {
+            target.setCurrentHand(source.getActiveHand());
+        } else {
+            target.clearActiveItem();
+        }
+    }
+
+    private static void removeEntityIfPresent(ClientWorld world, int entityId) {
+        try {
+            world.removeEntity(entityId, Entity.RemovalReason.DISCARDED);
+        } catch (RuntimeException ignored) {
+            // Best-effort cleanup.
+        }
+    }
+
+    private static byte[] encodePngBytes(NativeImage image) throws IOException {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        BufferedImage bufferedImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        bufferedImage.setRGB(0, 0, width, height, image.copyPixelsArgb(), 0, width);
+
+        try (ByteArrayOutputStream output = new ByteArrayOutputStream(Math.max(1024, width * height / 2))) {
+            if (!ImageIO.write(bufferedImage, "png", output)) {
+                throw new IOException("No PNG image writer available.");
+            }
+            return output.toByteArray();
+        }
+    }
+
+    private static ClickEvent.OpenUrl createOpenUrlClickEvent(String url) {
+        return new ClickEvent.OpenUrl(URI.create(url));
     }
 
     private static LiteralArgumentBuilder<FabricClientCommandSource> buildRootCommand(String root) {
@@ -371,7 +529,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private static final UUID PANORAMA_RENDER_PLAYER_PROFILE_ID = UUID.fromString("2a89a050-bf8c-4187-b2c3-f1f008f6422f");
         private static final int PANORAMA_RENDER_PLAYER_ENTITY_ID = Integer.MIN_VALUE + 42;
         private static final int PANORAMA_RESOLUTION = 1024;
-        private static final int CLEAR_COLOR_AND_DEPTH = 0x4100;
         private static final int[] CUBEMAP_LAYOUT = {
             3, 1, 4,
             5, 0, 2
@@ -382,8 +539,13 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private long tickCounter;
         private long intervalTicks;
         private long nextCycleTick;
+        private long cycleStartTick;
         private int completedCycles;
         private int activeFaceIndex = -1;
+        private boolean cycleInProgress;
+        private int facesScheduledInCycle;
+        private int pendingFaceCaptures;
+        private long captureSessionId;
         private Vec3d origin = Vec3d.ZERO;
         private float baseYaw;
         private float basePitch;
@@ -391,6 +553,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private ClientWorld panoramaWorld;
         private OtherClientPlayerEntity panoramaRenderPlayerEntity;
         private ClientWorld panoramaRenderPlayerWorld;
+        private Framebuffer vanillaMainFramebuffer;
         private SimpleFramebuffer panoramaRenderFramebuffer;
         private final NativeImage[] capturedFaces = new NativeImage[6];
         private volatile byte[] latestCubemapBytes;
@@ -421,29 +584,29 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 ensurePanoramaEntity(client.world);
             }
 
-            if (tickCounter < nextCycleTick) {
+            if (!cycleInProgress && tickCounter < nextCycleTick) {
                 return;
             }
 
             try {
-                if (preciseCaptureMode) {
-                    capturePanoramaCycle(client);
-                    completedCycles++;
-                    nextCycleTick = tickCounter + intervalTicks;
-                    submitStitchJob(client, detachCapturedFaces(), completedCycles);
-                } else {
-                    if (activeFaceIndex < 0) {
-                        activeFaceIndex = 0;
-                    }
-                    capturePanoramaFace(client, activeFaceIndex);
-                    activeFaceIndex++;
-                    if (activeFaceIndex >= 6) {
-                        activeFaceIndex = -1;
-                        completedCycles++;
-                        nextCycleTick = tickCounter + intervalTicks;
-                        submitStitchJob(client, detachCapturedFaces(), completedCycles);
-                    }
+                if (!cycleInProgress) {
+                    startCycle();
                 }
+
+                // 1.21.10 screenshot readback is async; avoid overlapping reads against the same render target.
+                if (pendingFaceCaptures > 0) {
+                    return;
+                }
+
+                if (facesScheduledInCycle >= 6) {
+                    return;
+                }
+
+                if (!preciseCaptureMode && tickCounter < faceDueTick(facesScheduledInCycle)) {
+                    return;
+                }
+
+                schedulePanoramaFace(client, facesScheduledInCycle);
             } catch (Exception exception) {
                 stopInternal(client, false, null);
                 send(client, "Panorama capture failed: " + exception.getMessage());
@@ -471,13 +634,19 @@ public final class SpectatorCamClient implements ClientModInitializer {
             baseYaw = yaw;
             basePitch = clampPitch(pitch);
             intervalTicks = Math.max(1L, Math.round(intervalSeconds * 20.0));
+            captureSessionId++;
             running = true;
             completedCycles = 0;
+            cycleInProgress = false;
+            facesScheduledInCycle = 0;
+            pendingFaceCaptures = 0;
             activeFaceIndex = -1;
             clearCapturedFaces();
             nextCycleTick = tickCounter;
+            cycleStartTick = tickCounter;
             ensurePanoramaEntity(client.world);
             ensureFramebuffers(client);
+            vanillaMainFramebuffer = ((MinecraftClientAccessor)client).spectatorcam$getFramebuffer();
 
             try {
                 String viewerUrl = PANORAMA_WEB_SERVER.ensureStarted(this);
@@ -518,7 +687,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 return 1;
             }
 
-            if (!preciseCaptureMode && activeFaceIndex >= 0) {
+            if (!preciseCaptureMode && cycleInProgress && activeFaceIndex >= 0) {
                 send(client, String.format(
                     Locale.ROOT,
                     "Running: capturing face %d/6 at %.3f %.3f %.3f (yaw %.1f, pitch %.1f, mode %s).",
@@ -548,9 +717,30 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return 1;
         }
 
-        private void capturePanoramaFace(MinecraftClient client, int index) {
+        private void startCycle() {
+            cycleInProgress = true;
+            cycleStartTick = tickCounter;
+            facesScheduledInCycle = 0;
+            pendingFaceCaptures = 0;
+            activeFaceIndex = preciseCaptureMode ? -1 : 0;
+            clearCapturedFaces();
+        }
+
+        private long faceDueTick(int faceIndex) {
+            return cycleStartTick + (intervalTicks * faceIndex) / 6L;
+        }
+
+        private void schedulePanoramaFace(MinecraftClient client, int index) {
+            long sessionId = captureSessionId;
+            pendingFaceCaptures++;
+            facesScheduledInCycle++;
+            activeFaceIndex = facesScheduledInCycle >= 6 ? -1 : facesScheduledInCycle;
+
             try (RenderContext context = beginPanoramaRender(client)) {
-                renderPanoramaFace(client, index);
+                renderPanoramaFace(client, index, sessionId);
+            } catch (Exception exception) {
+                pendingFaceCaptures = Math.max(0, pendingFaceCaptures - 1);
+                throw exception;
             }
         }
 
@@ -572,6 +762,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         private int setPreciseCaptureMode(MinecraftClient client, boolean precise) {
             preciseCaptureMode = precise;
+            captureSessionId++;
+            cycleInProgress = false;
+            facesScheduledInCycle = 0;
+            pendingFaceCaptures = 0;
+            cycleStartTick = 0L;
             activeFaceIndex = -1;
             clearCapturedFaces();
             send(client, "Panorama mode set to " + (precise ? "precise" : "smooth") + ".");
@@ -585,23 +780,26 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         private int setRenderPlayerEnabled(MinecraftClient client, boolean enabled) {
             renderPlayerEnabled = enabled;
+            if (client.world != null && !enabled) {
+                removeEntityIfPresent(client.world, PANORAMA_RENDER_PLAYER_ENTITY_ID);
+            }
+            panoramaRenderPlayerEntity = null;
+            panoramaRenderPlayerWorld = null;
             send(client, "Panorama renderplayer " + (enabled ? "enabled" : "disabled") + ".");
             return 1;
-        }
-
-        private void capturePanoramaCycle(MinecraftClient client) {
-            try (RenderContext context = beginPanoramaRender(client)) {
-                for (int index = 0; index < 6; index++) {
-                    renderPanoramaFace(client, index);
-                }
-            }
         }
 
         private RenderContext beginPanoramaRender(MinecraftClient client) {
             ensureFramebuffers(client);
 
             MinecraftClientAccessor clientAccessor = (MinecraftClientAccessor)client;
-            Framebuffer mainFramebuffer = clientAccessor.spectatorcam$getFramebuffer();
+            Framebuffer currentFramebuffer = clientAccessor.spectatorcam$getFramebuffer();
+            if (vanillaMainFramebuffer == null || vanillaMainFramebuffer == panoramaRenderFramebuffer) {
+                vanillaMainFramebuffer = currentFramebuffer;
+            }
+            Framebuffer mainFramebuffer = currentFramebuffer == panoramaRenderFramebuffer && vanillaMainFramebuffer != null
+                ? vanillaMainFramebuffer
+                : currentFramebuffer;
             Entity previousCameraEntity = client.getCameraEntity();
             Perspective previousPerspective = client.options.getPerspective();
             int previousFov = client.options.getFov().getValue();
@@ -615,58 +813,117 @@ public final class SpectatorCamClient implements ClientModInitializer {
             ClientWorld renderPlayerWorld = null;
             boolean renderPlayerAdded = false;
 
-            windowAccessor.spectatorcam$setWidth(PANORAMA_RESOLUTION);
-            windowAccessor.spectatorcam$setHeight(PANORAMA_RESOLUTION);
-            window.setFramebufferWidth(PANORAMA_RESOLUTION);
-            window.setFramebufferHeight(PANORAMA_RESOLUTION);
+            try {
+                windowAccessor.spectatorcam$setWidth(PANORAMA_RESOLUTION);
+                windowAccessor.spectatorcam$setHeight(PANORAMA_RESOLUTION);
+                window.setFramebufferWidth(PANORAMA_RESOLUTION);
+                window.setFramebufferHeight(PANORAMA_RESOLUTION);
 
-            clientAccessor.spectatorcam$setFramebuffer(panoramaRenderFramebuffer);
-            panoramaRenderFramebuffer.beginWrite(true);
-            RenderSystem.viewport(0, 0, PANORAMA_RESOLUTION, PANORAMA_RESOLUTION);
+                if (renderPlayerEnabled && client.player != null && client.world != null) {
+                    removeEntityIfPresent(client.world, PANORAMA_RENDER_PLAYER_ENTITY_ID);
+                    OtherClientPlayerEntity renderPlayer = ensureRenderPlayerEntity(client.world, client.player);
+                    syncRenderPlayerEntityState(client.player, renderPlayer);
+                    client.world.addEntity(renderPlayer);
+                    renderPlayerWorld = client.world;
+                    renderPlayerAdded = true;
+                }
 
-            client.setCameraEntity(panoramaEntity);
-            client.options.setPerspective(Perspective.FIRST_PERSON);
-            client.options.getFov().setValue(90);
-            client.gameRenderer.setRenderingPanorama(true);
-            client.worldRenderer.scheduleTerrainUpdate();
-            if (renderPlayerEnabled && client.player != null && client.world != null) {
-                OtherClientPlayerEntity renderPlayer = ensureRenderPlayerEntity(client.world, client.player);
-                syncRenderPlayerEntity(client.player, renderPlayer);
-                client.world.addEntity(renderPlayer);
-                renderPlayerWorld = client.world;
-                renderPlayerAdded = true;
+                clientAccessor.spectatorcam$setFramebuffer(panoramaRenderFramebuffer);
+                client.setCameraEntity(panoramaEntity);
+                client.options.setPerspective(Perspective.FIRST_PERSON);
+                client.options.getFov().setValue(90);
+                client.gameRenderer.setRenderingPanorama(true);
+
+                return new RenderContext(
+                    client,
+                    clientAccessor,
+                    mainFramebuffer,
+                    previousCameraEntity,
+                    previousPerspective,
+                    previousFov,
+                    previousPanoramaMode,
+                    window,
+                    windowAccessor,
+                    previousWindowWidth,
+                    previousWindowHeight,
+                    previousFramebufferWidth,
+                    previousFramebufferHeight,
+                    renderPlayerWorld,
+                    renderPlayerAdded
+                );
+            } catch (RuntimeException exception) {
+                try {
+                    clientAccessor.spectatorcam$setFramebuffer(mainFramebuffer);
+                } catch (RuntimeException ignored) {
+                    // Best-effort rollback.
+                }
+                try {
+                    windowAccessor.spectatorcam$setWidth(previousWindowWidth);
+                    windowAccessor.spectatorcam$setHeight(previousWindowHeight);
+                    window.setFramebufferWidth(previousFramebufferWidth);
+                    window.setFramebufferHeight(previousFramebufferHeight);
+                } catch (RuntimeException ignored) {
+                    // Best-effort rollback.
+                }
+                try {
+                    client.options.getFov().setValue(previousFov);
+                    client.options.setPerspective(previousPerspective);
+                    if (previousCameraEntity != null) {
+                        client.setCameraEntity(previousCameraEntity);
+                    } else if (client.player != null) {
+                        client.setCameraEntity(client.player);
+                    } else {
+                        client.setCameraEntity(null);
+                    }
+                } catch (RuntimeException ignored) {
+                    // Best-effort rollback.
+                }
+                try {
+                    client.gameRenderer.setRenderingPanorama(previousPanoramaMode);
+                } catch (RuntimeException ignored) {
+                    // Best-effort rollback.
+                }
+                if (renderPlayerAdded && renderPlayerWorld != null) {
+                    removeEntityIfPresent(renderPlayerWorld, PANORAMA_RENDER_PLAYER_ENTITY_ID);
+                }
+                throw exception;
             }
-
-            return new RenderContext(
-                client,
-                clientAccessor,
-                mainFramebuffer,
-                previousCameraEntity,
-                previousPerspective,
-                previousFov,
-                previousPanoramaMode,
-                window,
-                windowAccessor,
-                previousWindowWidth,
-                previousWindowHeight,
-                previousFramebufferWidth,
-                previousFramebufferHeight,
-                renderPlayerWorld,
-                renderPlayerAdded
-            );
         }
 
-        private void renderPanoramaFace(MinecraftClient client, int index) {
+        private void renderPanoramaFace(MinecraftClient client, int index, long sessionId) {
             positionPanoramaEntity(yawForIndex(index), pitchForIndex(index));
-            RenderSystem.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
-            RenderSystem.clear(CLEAR_COLOR_AND_DEPTH, MinecraftClient.IS_SYSTEM_MAC);
             client.gameRenderer.renderWorld(RenderTickCounter.ONE);
 
-            NativeImage face = ScreenshotRecorder.takeScreenshot(panoramaRenderFramebuffer);
-            if (capturedFaces[index] != null) {
-                capturedFaces[index].close();
+            takeScreenshotAsyncFast(client, panoramaRenderFramebuffer, image -> onPanoramaFaceCaptured(client, sessionId, index, image));
+        }
+
+        private void onPanoramaFaceCaptured(MinecraftClient client, long sessionId, int index, NativeImage image) {
+            boolean activeSession = sessionId == captureSessionId;
+            try {
+                if (!activeSession || !running) {
+                    image.close();
+                    return;
+                }
+
+                if (capturedFaces[index] != null) {
+                    capturedFaces[index].close();
+                }
+                capturedFaces[index] = image;
+            } finally {
+                if (activeSession) {
+                    pendingFaceCaptures = Math.max(0, pendingFaceCaptures - 1);
+                }
             }
-            capturedFaces[index] = face;
+
+            if (!cycleInProgress || facesScheduledInCycle < 6 || pendingFaceCaptures > 0) {
+                return;
+            }
+
+            cycleInProgress = false;
+            activeFaceIndex = -1;
+            completedCycles++;
+            nextCycleTick = Math.max(tickCounter + 1L, cycleStartTick + intervalTicks);
+            submitStitchJob(client, detachCapturedFaces());
         }
 
         private final class RenderContext implements AutoCloseable {
@@ -723,10 +980,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
             @Override
             public void close() {
                 client.gameRenderer.setRenderingPanorama(previousPanoramaMode);
-                client.worldRenderer.scheduleTerrainUpdate();
-                if (renderPlayerAdded && renderPlayerWorld != null) {
-                    renderPlayerWorld.removeEntity(PANORAMA_RENDER_PLAYER_ENTITY_ID, Entity.RemovalReason.DISCARDED);
-                }
                 windowAccessor.spectatorcam$setWidth(previousWindowWidth);
                 windowAccessor.spectatorcam$setHeight(previousWindowHeight);
                 window.setFramebufferWidth(previousFramebufferWidth);
@@ -741,12 +994,13 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     client.setCameraEntity(null);
                 }
                 clientAccessor.spectatorcam$setFramebuffer(mainFramebuffer);
-                mainFramebuffer.beginWrite(true);
-                RenderSystem.viewport(0, 0, mainFramebuffer.textureWidth, mainFramebuffer.textureHeight);
+                if (renderPlayerAdded && renderPlayerWorld != null) {
+                    removeEntityIfPresent(renderPlayerWorld, PANORAMA_RENDER_PLAYER_ENTITY_ID);
+                }
             }
         }
 
-        private void submitStitchJob(MinecraftClient client, NativeImage[] faces, int cycleNumber) {
+        private void submitStitchJob(MinecraftClient client, NativeImage[] faces) {
             if (!stitchInFlight.compareAndSet(false, true)) {
                 closeFaces(faces);
                 if (tickCounter - lastSkippedStitchMessageTick >= 100L) {
@@ -771,20 +1025,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
                     latestCubemapBytes = stitchedBytes;
                     latestCubemapTimestamp = modifiedTime;
-
-                    Path finalExportPath = exportPath;
-                    client.execute(() -> {
-                        if (finalExportPath == null) {
-                            send(client, String.format(Locale.ROOT, "Panorama cycle %d captured.", cycleNumber));
-                        } else {
-                            send(client, String.format(
-                                Locale.ROOT,
-                                "Panorama cycle %d captured (%s).",
-                                cycleNumber,
-                                finalExportPath.getFileName()
-                            ));
-                        }
-                    });
                 } catch (Exception exception) {
                     client.execute(() -> send(client, "Panorama stitch failed: " + exception.getMessage()));
                 } finally {
@@ -812,7 +1052,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                         );
                     }
                 }
-                return stitched.getBytes();
+                return encodePngBytes(stitched);
             }
         }
 
@@ -869,44 +1109,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
             if (panoramaRenderPlayerEntity != null && panoramaRenderPlayerWorld == world) {
                 return panoramaRenderPlayerEntity;
             }
-
-            GameProfile sourceProfile = sourcePlayer.getGameProfile();
-            GameProfile renderProfile = new GameProfile(PANORAMA_RENDER_PLAYER_PROFILE_ID, sourceProfile.getName());
-            renderProfile.getProperties().putAll(sourceProfile.getProperties());
-            panoramaRenderPlayerEntity = new OtherClientPlayerEntity(world, renderProfile);
-            panoramaRenderPlayerEntity.setId(PANORAMA_RENDER_PLAYER_ENTITY_ID);
+            panoramaRenderPlayerEntity = createRenderPlayerEntity(
+                world,
+                PANORAMA_RENDER_PLAYER_PROFILE_ID,
+                PANORAMA_RENDER_PLAYER_ENTITY_ID,
+                sourcePlayer
+            );
             panoramaRenderPlayerWorld = world;
             return panoramaRenderPlayerEntity;
-        }
-
-        private void syncRenderPlayerEntity(ClientPlayerEntity source, OtherClientPlayerEntity target) {
-            target.refreshPositionAndAngles(source.getX(), source.getY(), source.getZ(), source.getYaw(), source.getPitch());
-            target.setYaw(source.getYaw());
-            target.setPitch(source.getPitch());
-            target.prevYaw = source.prevYaw;
-            target.prevPitch = source.prevPitch;
-            target.prevX = source.prevX;
-            target.prevY = source.prevY;
-            target.prevZ = source.prevZ;
-            target.setVelocity(source.getVelocity());
-            target.setOnGround(source.isOnGround());
-            target.setSneaking(source.isSneaking());
-            target.setSprinting(source.isSprinting());
-            target.setSwimming(source.isSwimming());
-            target.setPose(source.getPose());
-            target.setHeadYaw(source.getHeadYaw());
-            target.setBodyYaw(source.getBodyYaw());
-            target.prevHeadYaw = source.prevHeadYaw;
-            target.prevBodyYaw = source.prevBodyYaw;
-            target.setInvisible(source.isInvisible());
-            for (EquipmentSlot slot : EquipmentSlot.values()) {
-                target.equipStack(slot, source.getEquippedStack(slot));
-            }
-            if (source.isUsingItem()) {
-                target.setCurrentHand(source.getActiveHand());
-            } else {
-                target.clearActiveItem();
-            }
         }
 
         private void ensureFramebuffers(MinecraftClient client) {
@@ -916,8 +1126,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 if (panoramaRenderFramebuffer != null) {
                     panoramaRenderFramebuffer.delete();
                 }
-                panoramaRenderFramebuffer = new SimpleFramebuffer(PANORAMA_RESOLUTION, PANORAMA_RESOLUTION, true, MinecraftClient.IS_SYSTEM_MAC);
-                panoramaRenderFramebuffer.setClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                panoramaRenderFramebuffer = new SimpleFramebuffer("panshot-panorama", PANORAMA_RESOLUTION, PANORAMA_RESOLUTION, true);
             }
         }
 
@@ -927,29 +1136,41 @@ public final class SpectatorCamClient implements ClientModInitializer {
             panoramaEntity.refreshPositionAndAngles(origin.x, entityY, origin.z, yaw, pitch);
             panoramaEntity.setYaw(yaw);
             panoramaEntity.setPitch(pitch);
-            panoramaEntity.prevYaw = yaw;
-            panoramaEntity.prevPitch = pitch;
-            panoramaEntity.prevX = origin.x;
-            panoramaEntity.prevY = entityY;
-            panoramaEntity.prevZ = origin.z;
+            panoramaEntity.lastYaw = yaw;
+            panoramaEntity.lastPitch = pitch;
+            panoramaEntity.lastX = origin.x;
+            panoramaEntity.lastY = entityY;
+            panoramaEntity.lastZ = origin.z;
             panoramaEntity.setVelocity(Vec3d.ZERO);
             panoramaEntity.setHeadYaw(yaw);
             panoramaEntity.setBodyYaw(yaw);
-            panoramaEntity.prevHeadYaw = yaw;
-            panoramaEntity.prevBodyYaw = yaw;
+            panoramaEntity.lastHeadYaw = yaw;
+            panoramaEntity.lastBodyYaw = yaw;
         }
 
         private void stopInternal(MinecraftClient client, boolean notify, String reason) {
+            captureSessionId++;
             running = false;
             intervalTicks = 0L;
             nextCycleTick = 0L;
+            cycleStartTick = 0L;
             completedCycles = 0;
+            cycleInProgress = false;
+            facesScheduledInCycle = 0;
+            pendingFaceCaptures = 0;
             activeFaceIndex = -1;
             clearCapturedFaces();
             panoramaEntity = null;
             panoramaWorld = null;
             panoramaRenderPlayerEntity = null;
             panoramaRenderPlayerWorld = null;
+            if (vanillaMainFramebuffer != null) {
+                try {
+                    ((MinecraftClientAccessor)client).spectatorcam$setFramebuffer(vanillaMainFramebuffer);
+                } catch (RuntimeException ignored) {
+                    // Best-effort rollback.
+                }
+            }
 
             if (panoramaRenderFramebuffer != null) {
                 panoramaRenderFramebuffer.delete();
@@ -973,7 +1194,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             if (client.player != null) {
                 Text link = Text.literal(url).styled(style -> style
                     .withUnderline(true)
-                    .withClickEvent(new ClickEvent(ClickEvent.Action.OPEN_URL, url)));
+                    .withClickEvent(createOpenUrlClickEvent(url)));
                 client.player.sendMessage(Text.literal(MESSAGE_PREFIX + "Panorama viewer: ").append(link), false);
             }
         }
@@ -1023,13 +1244,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private static final int DEFAULT_SINGLE_FOV = 90;
         private static final int MIN_SINGLE_FOV = 1;
         private static final int MAX_SINGLE_FOV = 179;
-        private static final int CLEAR_COLOR_AND_DEPTH = 0x4100;
 
         private volatile boolean running;
         private long tickCounter;
         private long intervalTicks;
         private long nextCaptureTick;
         private int completedCaptures;
+        private boolean capturePending;
+        private long captureSessionId;
         private Vec3d origin = Vec3d.ZERO;
         private float yaw;
         private float pitch;
@@ -1067,15 +1289,15 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 ensureSingleEntity(client.world);
             }
 
-            if (tickCounter < nextCaptureTick) {
+            if (capturePending || tickCounter < nextCaptureTick) {
                 return;
             }
 
             try {
-                NativeImage image = captureSingleFrame(client);
-                completedCaptures++;
+                long sessionId = captureSessionId;
+                capturePending = true;
                 nextCaptureTick = tickCounter + intervalTicks;
-                submitEncodeJob(client, image);
+                captureSingleFrame(client, sessionId);
             } catch (Exception exception) {
                 stopInternal(client, false, null);
                 send(client, "Single preview capture failed: " + exception.getMessage());
@@ -1103,8 +1325,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
             this.yaw = yaw;
             this.pitch = clampPitch(pitch);
             intervalTicks = Math.max(1L, Math.round(intervalSeconds * 20.0));
+            captureSessionId++;
             running = true;
             completedCaptures = 0;
+            capturePending = false;
             nextCaptureTick = tickCounter;
             ensureSingleEntity(client.world);
             ensureFramebuffers(captureWidth, captureHeight);
@@ -1214,9 +1438,9 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return 1;
         }
 
-        private NativeImage captureSingleFrame(MinecraftClient client) {
+        private void captureSingleFrame(MinecraftClient client, long sessionId) {
             try (RenderContext context = beginSingleRender(client)) {
-                return renderSingleFrame(client);
+                renderSingleFrame(client, sessionId);
             }
         }
 
@@ -1224,7 +1448,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
             int width = captureWidth;
             int height = captureHeight;
             int targetFov = captureFov;
-            float zoom = zoomFactorForFov(targetFov);
             ensureFramebuffers(width, height);
 
             MinecraftClientAccessor clientAccessor = (MinecraftClientAccessor)client;
@@ -1233,14 +1456,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
             Entity previousCameraEntity = client.getCameraEntity();
             Perspective previousPerspective = client.options.getPerspective();
             int previousFov = client.options.getFov().getValue();
-            float previousZoom = gameRendererAccessor.spectatorcam$getZoom();
-            float previousZoomX = gameRendererAccessor.spectatorcam$getZoomX();
-            float previousZoomY = gameRendererAccessor.spectatorcam$getZoomY();
-            boolean previousRenderHand = gameRendererAccessor.spectatorcam$isRenderHand();
             boolean previousRenderBlockOutline = gameRendererAccessor.spectatorcam$isRenderBlockOutline();
             float previousFovScale = gameRendererAccessor.spectatorcam$getFovScale();
             float previousOldFovScale = gameRendererAccessor.spectatorcam$getOldFovScale();
             boolean previousPanoramaMode = client.gameRenderer.isRenderingPanorama();
+            boolean previousHudHidden = client.options.hudHidden;
             Window window = client.getWindow();
             WindowAccessor windowAccessor = (WindowAccessor)(Object)window;
             int previousWindowWidth = window.getWidth();
@@ -1256,21 +1476,17 @@ public final class SpectatorCamClient implements ClientModInitializer {
             window.setFramebufferHeight(height);
 
             clientAccessor.spectatorcam$setFramebuffer(singleRenderFramebuffer);
-            singleRenderFramebuffer.beginWrite(true);
-            RenderSystem.viewport(0, 0, width, height);
 
             client.setCameraEntity(singleEntity);
             client.options.setPerspective(Perspective.FIRST_PERSON);
-            gameRendererAccessor.spectatorcam$setZoom(zoom);
-            gameRendererAccessor.spectatorcam$setZoomX(0.0f);
-            gameRendererAccessor.spectatorcam$setZoomY(0.0f);
-            gameRendererAccessor.spectatorcam$setRenderHand(false);
+            client.options.getFov().setValue(targetFov);
+            client.options.hudHidden = true;
             gameRendererAccessor.spectatorcam$setRenderBlockOutline(false);
-            client.gameRenderer.setRenderingPanorama(true);
-            client.worldRenderer.scheduleTerrainUpdate();
+            client.gameRenderer.setRenderingPanorama(false);
             if (renderPlayerEnabled && client.player != null && client.world != null) {
+                removeEntityIfPresent(client.world, SINGLE_RENDER_PLAYER_ENTITY_ID);
                 OtherClientPlayerEntity renderPlayer = ensureRenderPlayerEntity(client.world, client.player);
-                syncRenderPlayerEntity(client.player, renderPlayer);
+                syncRenderPlayerEntityState(client.player, renderPlayer);
                 client.world.addEntity(renderPlayer);
                 renderPlayerWorld = client.world;
                 renderPlayerAdded = true;
@@ -1284,14 +1500,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 previousCameraEntity,
                 previousPerspective,
                 previousFov,
-                previousZoom,
-                previousZoomX,
-                previousZoomY,
-                previousRenderHand,
                 previousRenderBlockOutline,
                 previousFovScale,
                 previousOldFovScale,
                 previousPanoramaMode,
+                previousHudHidden,
                 window,
                 windowAccessor,
                 previousWindowWidth,
@@ -1303,12 +1516,21 @@ public final class SpectatorCamClient implements ClientModInitializer {
             );
         }
 
-        private NativeImage renderSingleFrame(MinecraftClient client) {
+        private void renderSingleFrame(MinecraftClient client, long sessionId) {
             positionSingleEntity(yaw, pitch);
-            RenderSystem.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
-            RenderSystem.clear(CLEAR_COLOR_AND_DEPTH, MinecraftClient.IS_SYSTEM_MAC);
             client.gameRenderer.renderWorld(RenderTickCounter.ONE);
-            return ScreenshotRecorder.takeScreenshot(singleRenderFramebuffer);
+            takeScreenshotAsyncFast(client, singleRenderFramebuffer, image -> onSingleFrameCaptured(client, sessionId, image));
+        }
+
+        private void onSingleFrameCaptured(MinecraftClient client, long sessionId, NativeImage image) {
+            if (sessionId != captureSessionId || !running) {
+                image.close();
+                return;
+            }
+
+            completedCaptures++;
+            capturePending = false;
+            submitEncodeJob(client, image);
         }
 
         private final class RenderContext implements AutoCloseable {
@@ -1319,14 +1541,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
             private final Entity previousCameraEntity;
             private final Perspective previousPerspective;
             private final int previousFov;
-            private final float previousZoom;
-            private final float previousZoomX;
-            private final float previousZoomY;
-            private final boolean previousRenderHand;
             private final boolean previousRenderBlockOutline;
             private final float previousFovScale;
             private final float previousOldFovScale;
             private final boolean previousPanoramaMode;
+            private final boolean previousHudHidden;
             private final Window window;
             private final WindowAccessor windowAccessor;
             private final int previousWindowWidth;
@@ -1344,14 +1563,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 Entity previousCameraEntity,
                 Perspective previousPerspective,
                 int previousFov,
-                float previousZoom,
-                float previousZoomX,
-                float previousZoomY,
-                boolean previousRenderHand,
                 boolean previousRenderBlockOutline,
                 float previousFovScale,
                 float previousOldFovScale,
                 boolean previousPanoramaMode,
+                boolean previousHudHidden,
                 Window window,
                 WindowAccessor windowAccessor,
                 int previousWindowWidth,
@@ -1368,14 +1584,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 this.previousCameraEntity = previousCameraEntity;
                 this.previousPerspective = previousPerspective;
                 this.previousFov = previousFov;
-                this.previousZoom = previousZoom;
-                this.previousZoomX = previousZoomX;
-                this.previousZoomY = previousZoomY;
-                this.previousRenderHand = previousRenderHand;
                 this.previousRenderBlockOutline = previousRenderBlockOutline;
                 this.previousFovScale = previousFovScale;
                 this.previousOldFovScale = previousOldFovScale;
                 this.previousPanoramaMode = previousPanoramaMode;
+                this.previousHudHidden = previousHudHidden;
                 this.window = window;
                 this.windowAccessor = windowAccessor;
                 this.previousWindowWidth = previousWindowWidth;
@@ -1389,22 +1602,15 @@ public final class SpectatorCamClient implements ClientModInitializer {
             @Override
             public void close() {
                 client.gameRenderer.setRenderingPanorama(previousPanoramaMode);
-                client.worldRenderer.scheduleTerrainUpdate();
-                if (renderPlayerAdded && renderPlayerWorld != null) {
-                    renderPlayerWorld.removeEntity(SINGLE_RENDER_PLAYER_ENTITY_ID, Entity.RemovalReason.DISCARDED);
-                }
                 windowAccessor.spectatorcam$setWidth(previousWindowWidth);
                 windowAccessor.spectatorcam$setHeight(previousWindowHeight);
                 window.setFramebufferWidth(previousFramebufferWidth);
                 window.setFramebufferHeight(previousFramebufferHeight);
                 client.options.getFov().setValue(previousFov);
-                gameRendererAccessor.spectatorcam$setZoom(previousZoom);
-                gameRendererAccessor.spectatorcam$setZoomX(previousZoomX);
-                gameRendererAccessor.spectatorcam$setZoomY(previousZoomY);
-                gameRendererAccessor.spectatorcam$setRenderHand(previousRenderHand);
                 gameRendererAccessor.spectatorcam$setRenderBlockOutline(previousRenderBlockOutline);
                 gameRendererAccessor.spectatorcam$setFovScale(previousFovScale);
                 gameRendererAccessor.spectatorcam$setOldFovScale(previousOldFovScale);
+                client.options.hudHidden = previousHudHidden;
                 client.options.setPerspective(previousPerspective);
                 if (previousCameraEntity != null) {
                     client.setCameraEntity(previousCameraEntity);
@@ -1414,8 +1620,9 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     client.setCameraEntity(null);
                 }
                 clientAccessor.spectatorcam$setFramebuffer(mainFramebuffer);
-                mainFramebuffer.beginWrite(true);
-                RenderSystem.viewport(0, 0, mainFramebuffer.textureWidth, mainFramebuffer.textureHeight);
+                if (renderPlayerAdded && renderPlayerWorld != null) {
+                    removeEntityIfPresent(renderPlayerWorld, SINGLE_RENDER_PLAYER_ENTITY_ID);
+                }
             }
         }
 
@@ -1431,7 +1638,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             encodeExecutor.execute(() -> {
                 try (NativeImage capturedImage = image) {
-                    latestImageBytes = capturedImage.getBytes();
+                    latestImageBytes = encodePngBytes(capturedImage);
                     latestImageTimestamp = System.currentTimeMillis();
                 } catch (Exception exception) {
                     client.execute(() -> send(client, "Single preview encode failed: " + exception.getMessage()));
@@ -1453,19 +1660,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return Math.max(MIN_SINGLE_FOV, Math.min(MAX_SINGLE_FOV, fov));
         }
 
-        private float zoomFactorForFov(int targetFov) {
-            double targetRadians = Math.toRadians(targetFov);
-            double targetTan = Math.tan(targetRadians * 0.5);
-            if (!Double.isFinite(targetTan) || targetTan <= 0.0) {
-                return 1.0f;
-            }
-            double zoom = 1.0 / targetTan;
-            if (!Double.isFinite(zoom) || zoom <= 0.0) {
-                return 1.0f;
-            }
-            return (float)zoom;
-        }
-
         private void ensureSingleEntity(ClientWorld world) {
             if (singleEntity != null && singleWorld == world) {
                 return;
@@ -1482,43 +1676,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 return singleRenderPlayerEntity;
             }
 
-            GameProfile sourceProfile = sourcePlayer.getGameProfile();
-            GameProfile renderProfile = new GameProfile(SINGLE_RENDER_PLAYER_PROFILE_ID, sourceProfile.getName());
-            renderProfile.getProperties().putAll(sourceProfile.getProperties());
-            singleRenderPlayerEntity = new OtherClientPlayerEntity(world, renderProfile);
-            singleRenderPlayerEntity.setId(SINGLE_RENDER_PLAYER_ENTITY_ID);
+            singleRenderPlayerEntity = createRenderPlayerEntity(
+                world,
+                SINGLE_RENDER_PLAYER_PROFILE_ID,
+                SINGLE_RENDER_PLAYER_ENTITY_ID,
+                sourcePlayer
+            );
             singleRenderPlayerWorld = world;
             return singleRenderPlayerEntity;
-        }
-
-        private void syncRenderPlayerEntity(ClientPlayerEntity source, OtherClientPlayerEntity target) {
-            target.refreshPositionAndAngles(source.getX(), source.getY(), source.getZ(), source.getYaw(), source.getPitch());
-            target.setYaw(source.getYaw());
-            target.setPitch(source.getPitch());
-            target.prevYaw = source.prevYaw;
-            target.prevPitch = source.prevPitch;
-            target.prevX = source.prevX;
-            target.prevY = source.prevY;
-            target.prevZ = source.prevZ;
-            target.setVelocity(source.getVelocity());
-            target.setOnGround(source.isOnGround());
-            target.setSneaking(source.isSneaking());
-            target.setSprinting(source.isSprinting());
-            target.setSwimming(source.isSwimming());
-            target.setPose(source.getPose());
-            target.setHeadYaw(source.getHeadYaw());
-            target.setBodyYaw(source.getBodyYaw());
-            target.prevHeadYaw = source.prevHeadYaw;
-            target.prevBodyYaw = source.prevBodyYaw;
-            target.setInvisible(source.isInvisible());
-            for (EquipmentSlot slot : EquipmentSlot.values()) {
-                target.equipStack(slot, source.getEquippedStack(slot));
-            }
-            if (source.isUsingItem()) {
-                target.setCurrentHand(source.getActiveHand());
-            } else {
-                target.clearActiveItem();
-            }
         }
 
         private void ensureFramebuffers(int width, int height) {
@@ -1528,8 +1693,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 if (singleRenderFramebuffer != null) {
                     singleRenderFramebuffer.delete();
                 }
-                singleRenderFramebuffer = new SimpleFramebuffer(width, height, true, MinecraftClient.IS_SYSTEM_MAC);
-                singleRenderFramebuffer.setClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                singleRenderFramebuffer = new SimpleFramebuffer("panshot-single", width, height, true);
             }
         }
 
@@ -1538,23 +1702,25 @@ public final class SpectatorCamClient implements ClientModInitializer {
             singleEntity.refreshPositionAndAngles(origin.x, entityY, origin.z, yaw, pitch);
             singleEntity.setYaw(yaw);
             singleEntity.setPitch(pitch);
-            singleEntity.prevYaw = yaw;
-            singleEntity.prevPitch = pitch;
-            singleEntity.prevX = origin.x;
-            singleEntity.prevY = entityY;
-            singleEntity.prevZ = origin.z;
+            singleEntity.lastYaw = yaw;
+            singleEntity.lastPitch = pitch;
+            singleEntity.lastX = origin.x;
+            singleEntity.lastY = entityY;
+            singleEntity.lastZ = origin.z;
             singleEntity.setVelocity(Vec3d.ZERO);
             singleEntity.setHeadYaw(yaw);
             singleEntity.setBodyYaw(yaw);
-            singleEntity.prevHeadYaw = yaw;
-            singleEntity.prevBodyYaw = yaw;
+            singleEntity.lastHeadYaw = yaw;
+            singleEntity.lastBodyYaw = yaw;
         }
 
         private void stopInternal(MinecraftClient client, boolean notify, String reason) {
+            captureSessionId++;
             running = false;
             intervalTicks = 0L;
             nextCaptureTick = 0L;
             completedCaptures = 0;
+            capturePending = false;
             singleEntity = null;
             singleWorld = null;
             singleRenderPlayerEntity = null;
@@ -1582,7 +1748,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             if (client.player != null) {
                 Text link = Text.literal(url).styled(style -> style
                     .withUnderline(true)
-                    .withClickEvent(new ClickEvent(ClickEvent.Action.OPEN_URL, url)));
+                    .withClickEvent(createOpenUrlClickEvent(url)));
                 client.player.sendMessage(Text.literal(MESSAGE_PREFIX + "Single viewer: ").append(link), false);
             }
         }
