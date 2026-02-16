@@ -14,3 +14,23 @@ Usage
 /panshot panorama start every 5
 
 /panshot single every 5
+
+/panshot panorama downscale 2.0 cubemap bicubic
+
+/panshot panorama nudge 0.05
+
+Downscale syntax:
+
+/panshot panorama downscale <factor> [stage] [interpolation]
+
+- `factor`: `1.0` disables scaling, values `> 1.0` downscale.
+- `stage`: `faces` (before stitching) or `cubemap` (after stitching, default).
+- `interpolation`: `nearest`, `bilinear`, `bicubic` (or `cubic`), `supersample`, `box`.
+
+Nudge syntax:
+
+/panshot panorama nudge <distance>
+
+- Applies a per-face offset along that face camera direction before capture.
+- Example: with `0.05`, face 0/1/2/3 are nudged forward in each cardinal direction, face 4 nudges up, face 5 nudges down.
+- Use `/panshot panorama nudge off` to disable.

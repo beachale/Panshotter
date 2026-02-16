@@ -8,6 +8,7 @@ import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.panshot.spectatorcam.mixin.GameRendererAccessor;
@@ -34,6 +35,8 @@ import net.minecraft.text.ClickEvent;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.Vec3d;
 
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -209,17 +212,26 @@ public final class SpectatorCamClient implements ClientModInitializer {
     }
 
     private static byte[] encodePngBytes(NativeImage image) throws IOException {
-        int width = image.getWidth();
-        int height = image.getHeight();
-        BufferedImage bufferedImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-        bufferedImage.setRGB(0, 0, width, height, image.copyPixelsArgb(), 0, width);
+        return encodePngBytes(toBufferedImage(image));
+    }
 
+    private static byte[] encodePngBytes(BufferedImage bufferedImage) throws IOException {
+        int width = bufferedImage.getWidth();
+        int height = bufferedImage.getHeight();
         try (ByteArrayOutputStream output = new ByteArrayOutputStream(Math.max(1024, width * height / 2))) {
             if (!ImageIO.write(bufferedImage, "png", output)) {
                 throw new IOException("No PNG image writer available.");
             }
             return output.toByteArray();
         }
+    }
+
+    private static BufferedImage toBufferedImage(NativeImage image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        BufferedImage bufferedImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        bufferedImage.setRGB(0, 0, width, height, image.copyPixelsArgb(), 0, width);
+        return bufferedImage;
     }
 
     private static ClickEvent.OpenUrl createOpenUrlClickEvent(String url) {
@@ -281,6 +293,40 @@ public final class SpectatorCamClient implements ClientModInitializer {
             ))
             .then(startX)
             .then(literal("every").then(everyInterval));
+
+        LiteralArgumentBuilder<FabricClientCommandSource> panoramaDownscale = literal("downscale")
+            .executes(context -> PANORAMA_CONTROLLER.downscaleStatus(context.getSource().getClient()))
+            .then(literal("off").executes(context -> PANORAMA_CONTROLLER.disableDownscale(context.getSource().getClient())))
+            .then(argument("factor", DoubleArgumentType.doubleArg(1.0, 64.0))
+                .executes(context -> PANORAMA_CONTROLLER.setDownscale(
+                    context.getSource().getClient(),
+                    DoubleArgumentType.getDouble(context, "factor"),
+                    null,
+                    null
+                ))
+                .then(argument("stage", StringArgumentType.word())
+                    .executes(context -> PANORAMA_CONTROLLER.setDownscale(
+                        context.getSource().getClient(),
+                        DoubleArgumentType.getDouble(context, "factor"),
+                        StringArgumentType.getString(context, "stage"),
+                        null
+                    ))
+                    .then(argument("interpolation", StringArgumentType.word())
+                        .executes(context -> PANORAMA_CONTROLLER.setDownscale(
+                            context.getSource().getClient(),
+                            DoubleArgumentType.getDouble(context, "factor"),
+                            StringArgumentType.getString(context, "stage"),
+                            StringArgumentType.getString(context, "interpolation")
+                        )))));
+
+        LiteralArgumentBuilder<FabricClientCommandSource> panoramaNudge = literal("nudge")
+            .executes(context -> PANORAMA_CONTROLLER.captureNudgeStatus(context.getSource().getClient()))
+            .then(literal("off").executes(context -> PANORAMA_CONTROLLER.disableCaptureNudge(context.getSource().getClient())))
+            .then(argument("distance", DoubleArgumentType.doubleArg(-10.0, 10.0))
+                .executes(context -> PANORAMA_CONTROLLER.setCaptureNudge(
+                    context.getSource().getClient(),
+                    DoubleArgumentType.getDouble(context, "distance")
+                )));
 
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singlePitch =
             argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0))
@@ -384,7 +430,9 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 .then(literal("export")
                     .executes(context -> PANORAMA_CONTROLLER.exportStatus(context.getSource().getClient()))
                     .then(literal("on").executes(context -> PANORAMA_CONTROLLER.setExportEnabled(context.getSource().getClient(), true)))
-                    .then(literal("off").executes(context -> PANORAMA_CONTROLLER.setExportEnabled(context.getSource().getClient(), false)))))
+                    .then(literal("off").executes(context -> PANORAMA_CONTROLLER.setExportEnabled(context.getSource().getClient(), false))))
+                .then(panoramaDownscale)
+                .then(panoramaNudge))
             .then(literal("tp")
                 .then(argument("x", DoubleArgumentType.doubleArg())
                     .then(argument("y", DoubleArgumentType.doubleArg())
@@ -534,6 +582,54 @@ public final class SpectatorCamClient implements ClientModInitializer {
             5, 0, 2
         };
         private static final String CUBEMAP_FILE_NAME = "panorama_cubemap.png";
+        private static final double MIN_DOWNSCALE_FACTOR = 1.0;
+        private static final double NUDGE_EPSILON = 1.0E-6;
+
+        private enum DownscaleStage {
+            FACES("faces"),
+            CUBEMAP("cubemap");
+
+            private final String label;
+
+            DownscaleStage(String label) {
+                this.label = label;
+            }
+
+            private static DownscaleStage parse(String token) {
+                String normalized = token.toLowerCase(Locale.ROOT);
+                return switch (normalized) {
+                    case "faces", "face", "pre", "before", "before_stitch", "prestitch" -> FACES;
+                    case "cubemap", "cube", "post", "after", "after_stitch", "poststitch" -> CUBEMAP;
+                    default -> null;
+                };
+            }
+        }
+
+        private enum DownscaleInterpolation {
+            NEAREST("nearest"),
+            BILINEAR("bilinear"),
+            BICUBIC("bicubic"),
+            BOX("box"),
+            SUPERSAMPLE("supersample");
+
+            private final String label;
+
+            DownscaleInterpolation(String label) {
+                this.label = label;
+            }
+
+            private static DownscaleInterpolation parse(String token) {
+                String normalized = token.toLowerCase(Locale.ROOT);
+                return switch (normalized) {
+                    case "nearest", "nearest_neighbor", "nearest-neighbor" -> NEAREST;
+                    case "linear", "bilinear" -> BILINEAR;
+                    case "cubic", "bicubic" -> BICUBIC;
+                    case "box", "area", "boxscale", "box_scaling", "box-scaling" -> BOX;
+                    case "supersample", "supersampling", "super", "ssaa" -> SUPERSAMPLE;
+                    default -> null;
+                };
+            }
+        }
 
         private volatile boolean running;
         private long tickCounter;
@@ -561,6 +657,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private volatile boolean exportToDisk;
         private volatile boolean preciseCaptureMode;
         private volatile boolean renderPlayerEnabled;
+        private volatile double captureNudgeDistance;
+        private volatile double downscaleFactor = MIN_DOWNSCALE_FACTOR;
+        private volatile DownscaleStage downscaleStage = DownscaleStage.CUBEMAP;
+        private volatile DownscaleInterpolation downscaleInterpolation = DownscaleInterpolation.BICUBIC;
         private final ExecutorService stitchExecutor = Executors.newSingleThreadExecutor(runnable -> {
             Thread thread = new Thread(runnable, "panshot-stitch");
             thread.setDaemon(true);
@@ -657,14 +757,16 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             send(client, String.format(
                 Locale.ROOT,
-                "Panorama capture started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, mode %s).",
+                "Panorama capture started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, mode %s, downscale %s, nudge %s).",
                 x,
                 y,
                 z,
                 intervalTicks / 20.0,
                 baseYaw,
                 basePitch,
-                preciseCaptureMode ? "precise" : "smooth"
+                preciseCaptureMode ? "precise" : "smooth",
+                describeDownscale(),
+                describeCaptureNudge()
             ));
             return 1;
         }
@@ -690,14 +792,16 @@ public final class SpectatorCamClient implements ClientModInitializer {
             if (!preciseCaptureMode && cycleInProgress && activeFaceIndex >= 0) {
                 send(client, String.format(
                     Locale.ROOT,
-                    "Running: capturing face %d/6 at %.3f %.3f %.3f (yaw %.1f, pitch %.1f, mode %s).",
+                    "Running: capturing face %d/6 at %.3f %.3f %.3f (yaw %.1f, pitch %.1f, mode %s, downscale %s, nudge %s).",
                     activeFaceIndex + 1,
                     origin.x,
                     origin.y,
                     origin.z,
                     baseYaw,
                     basePitch,
-                    preciseCaptureMode ? "precise" : "smooth"
+                    preciseCaptureMode ? "precise" : "smooth",
+                    describeDownscale(),
+                    describeCaptureNudge()
                 ));
                 return 1;
             }
@@ -705,14 +809,16 @@ public final class SpectatorCamClient implements ClientModInitializer {
             double seconds = Math.max(0.0, (nextCycleTick - tickCounter) / 20.0);
             send(client, String.format(
                 Locale.ROOT,
-                "Running: next cycle in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, mode %s).",
+                "Running: next cycle in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, mode %s, downscale %s, nudge %s).",
                 seconds,
                 origin.x,
                 origin.y,
                 origin.z,
                 baseYaw,
                 basePitch,
-                preciseCaptureMode ? "precise" : "smooth"
+                preciseCaptureMode ? "precise" : "smooth",
+                describeDownscale(),
+                describeCaptureNudge()
             ));
             return 1;
         }
@@ -787,6 +893,84 @@ public final class SpectatorCamClient implements ClientModInitializer {
             panoramaRenderPlayerWorld = null;
             send(client, "Panorama renderplayer " + (enabled ? "enabled" : "disabled") + ".");
             return 1;
+        }
+
+        private int captureNudgeStatus(MinecraftClient client) {
+            send(client, "Panorama nudge is " + describeCaptureNudge() + ".");
+            return 1;
+        }
+
+        private int disableCaptureNudge(MinecraftClient client) {
+            captureNudgeDistance = 0.0;
+            send(client, "Panorama nudge disabled.");
+            return 1;
+        }
+
+        private int setCaptureNudge(MinecraftClient client, double distance) {
+            captureNudgeDistance = distance;
+            send(client, "Panorama nudge set to " + describeCaptureNudge() + ".");
+            return 1;
+        }
+
+        private int downscaleStatus(MinecraftClient client) {
+            send(client, "Panorama downscale is " + describeDownscale() + ".");
+            return 1;
+        }
+
+        private int disableDownscale(MinecraftClient client) {
+            downscaleFactor = MIN_DOWNSCALE_FACTOR;
+            send(client, "Panorama downscale disabled.");
+            return 1;
+        }
+
+        private int setDownscale(MinecraftClient client, double factor, String stageToken, String interpolationToken) {
+            DownscaleStage resolvedStage = downscaleStage;
+            if (stageToken != null) {
+                resolvedStage = DownscaleStage.parse(stageToken);
+                if (resolvedStage == null) {
+                    send(client, "Unknown downscale stage '" + stageToken + "'. Use: faces or cubemap.");
+                    return 0;
+                }
+            }
+
+            DownscaleInterpolation resolvedInterpolation = downscaleInterpolation;
+            if (interpolationToken != null) {
+                resolvedInterpolation = DownscaleInterpolation.parse(interpolationToken);
+                if (resolvedInterpolation == null) {
+                    send(client, "Unknown interpolation '" + interpolationToken + "'. Use: nearest, bilinear, bicubic, cubic, box, supersample.");
+                    return 0;
+                }
+            }
+
+            downscaleFactor = Math.max(MIN_DOWNSCALE_FACTOR, factor);
+            downscaleStage = resolvedStage;
+            downscaleInterpolation = resolvedInterpolation;
+            send(client, "Panorama downscale set to " + describeDownscale() + ".");
+            return 1;
+        }
+
+        private String describeDownscale() {
+            double factor = downscaleFactor;
+            if (factor <= MIN_DOWNSCALE_FACTOR) {
+                return "off";
+            }
+
+            return String.format(
+                Locale.ROOT,
+                "%.2fx (%s, %s)",
+                factor,
+                downscaleStage.label,
+                downscaleInterpolation.label
+            );
+        }
+
+        private String describeCaptureNudge() {
+            double nudge = captureNudgeDistance;
+            if (Math.abs(nudge) <= NUDGE_EPSILON) {
+                return "off";
+            }
+
+            return String.format(Locale.ROOT, "%+.4f blocks", nudge);
         }
 
         private RenderContext beginPanoramaRender(MinecraftClient client) {
@@ -1035,25 +1219,227 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
 
         private byte[] stitchCubemapBytes(NativeImage[] faces) throws IOException {
-            try (NativeImage stitched = new NativeImage(PANORAMA_RESOLUTION * 3, PANORAMA_RESOLUTION * 2, false)) {
+            double factor = downscaleFactor;
+            DownscaleStage stage = downscaleStage;
+            DownscaleInterpolation interpolation = downscaleInterpolation;
+            int stitchedFaceSize = PANORAMA_RESOLUTION;
+            if (factor > MIN_DOWNSCALE_FACTOR && stage == DownscaleStage.FACES) {
+                stitchedFaceSize = scaledDimension(PANORAMA_RESOLUTION, factor);
+            }
+
+            BufferedImage stitched = new BufferedImage(stitchedFaceSize * 3, stitchedFaceSize * 2, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D stitchedGraphics = stitched.createGraphics();
+            try {
                 for (int row = 0; row < 2; row++) {
                     for (int col = 0; col < 3; col++) {
                         int faceIndex = CUBEMAP_LAYOUT[row * 3 + col];
-                        faces[faceIndex].copyRect(
-                            stitched,
-                            0,
-                            0,
-                            col * PANORAMA_RESOLUTION,
-                            row * PANORAMA_RESOLUTION,
-                            PANORAMA_RESOLUTION,
-                            PANORAMA_RESOLUTION,
-                            false,
-                            false
-                        );
+                        BufferedImage face = toBufferedImage(faces[faceIndex]);
+                        try {
+                            BufferedImage sourceForDraw = face;
+                            if (stitchedFaceSize != PANORAMA_RESOLUTION) {
+                                sourceForDraw = resizeBufferedImage(face, stitchedFaceSize, stitchedFaceSize, interpolation);
+                            }
+                            try {
+                                stitchedGraphics.drawImage(
+                                    sourceForDraw,
+                                    col * stitchedFaceSize,
+                                    row * stitchedFaceSize,
+                                    null
+                                );
+                            } finally {
+                                if (sourceForDraw != face) {
+                                    sourceForDraw.flush();
+                                }
+                            }
+                        } finally {
+                            face.flush();
+                        }
                     }
                 }
-                return encodePngBytes(stitched);
+            } finally {
+                stitchedGraphics.dispose();
             }
+
+            BufferedImage output = stitched;
+            if (factor > MIN_DOWNSCALE_FACTOR && stage == DownscaleStage.CUBEMAP) {
+                int targetWidth = scaledDimension(stitched.getWidth(), factor);
+                int targetHeight = scaledDimension(stitched.getHeight(), factor);
+                output = resizeBufferedImage(stitched, targetWidth, targetHeight, interpolation);
+            }
+
+            try {
+                return encodePngBytes(output);
+            } finally {
+                if (output != stitched) {
+                    output.flush();
+                }
+                stitched.flush();
+            }
+        }
+
+        private static int scaledDimension(int sourceDimension, double factor) {
+            if (factor <= MIN_DOWNSCALE_FACTOR) {
+                return sourceDimension;
+            }
+            int scaled = (int)Math.round(sourceDimension / factor);
+            return Math.max(1, Math.min(sourceDimension, scaled));
+        }
+
+        private static BufferedImage resizeBufferedImage(
+            BufferedImage source,
+            int targetWidth,
+            int targetHeight,
+            DownscaleInterpolation interpolation
+        ) {
+            if (source.getWidth() == targetWidth && source.getHeight() == targetHeight) {
+                return source;
+            }
+
+            return switch (interpolation) {
+                case NEAREST -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+                case BILINEAR -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                case BICUBIC -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                case BOX -> resizeBoxAveraging(source, targetWidth, targetHeight);
+                case SUPERSAMPLE -> resizeSupersample(source, targetWidth, targetHeight);
+            };
+        }
+
+        private static BufferedImage drawResizedImage(BufferedImage source, int targetWidth, int targetHeight, Object interpolationHint) {
+            BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D graphics = output.createGraphics();
+            try {
+                graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, interpolationHint);
+                graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                graphics.setRenderingHint(RenderingHints.KEY_ALPHA_INTERPOLATION, RenderingHints.VALUE_ALPHA_INTERPOLATION_QUALITY);
+                graphics.drawImage(source, 0, 0, targetWidth, targetHeight, null);
+            } finally {
+                graphics.dispose();
+            }
+            return output;
+        }
+
+        private static BufferedImage resizeSupersample(BufferedImage source, int targetWidth, int targetHeight) {
+            if (targetWidth >= source.getWidth() || targetHeight >= source.getHeight()) {
+                return drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            }
+
+            BufferedImage current = source;
+            boolean currentOwned = false;
+            while (current.getWidth() / 2 >= targetWidth && current.getHeight() / 2 >= targetHeight) {
+                int nextWidth = Math.max(targetWidth, current.getWidth() / 2);
+                int nextHeight = Math.max(targetHeight, current.getHeight() / 2);
+                BufferedImage next = drawResizedImage(current, nextWidth, nextHeight, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                if (currentOwned) {
+                    current.flush();
+                }
+                current = next;
+                currentOwned = true;
+            }
+
+            if (current.getWidth() != targetWidth || current.getHeight() != targetHeight) {
+                BufferedImage next = drawResizedImage(current, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                if (currentOwned) {
+                    current.flush();
+                }
+                current = next;
+            }
+
+            return current;
+        }
+
+        private static BufferedImage resizeBoxAveraging(BufferedImage source, int targetWidth, int targetHeight) {
+            if (targetWidth >= source.getWidth() || targetHeight >= source.getHeight()) {
+                return drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            }
+
+            int sourceWidth = source.getWidth();
+            int sourceHeight = source.getHeight();
+            int[] sourcePixels = source.getRGB(0, 0, sourceWidth, sourceHeight, null, 0, sourceWidth);
+            int[] outputPixels = new int[targetWidth * targetHeight];
+
+            double scaleX = (double)sourceWidth / targetWidth;
+            double scaleY = (double)sourceHeight / targetHeight;
+
+            for (int y = 0; y < targetHeight; y++) {
+                double srcY0 = y * scaleY;
+                double srcY1 = srcY0 + scaleY;
+                int minY = (int)Math.floor(srcY0);
+                int maxY = (int)Math.ceil(srcY1);
+                int outputRow = y * targetWidth;
+
+                for (int x = 0; x < targetWidth; x++) {
+                    double srcX0 = x * scaleX;
+                    double srcX1 = srcX0 + scaleX;
+                    int minX = (int)Math.floor(srcX0);
+                    int maxX = (int)Math.ceil(srcX1);
+
+                    double weightSum = 0.0;
+                    double alphaSum = 0.0;
+                    double redSum = 0.0;
+                    double greenSum = 0.0;
+                    double blueSum = 0.0;
+
+                    for (int srcY = minY; srcY < maxY; srcY++) {
+                        if (srcY < 0 || srcY >= sourceHeight) {
+                            continue;
+                        }
+                        double yCoverage = pixelCoverage(srcY, srcY0, srcY1);
+                        if (yCoverage <= 0.0) {
+                            continue;
+                        }
+
+                        int sourceRow = srcY * sourceWidth;
+                        for (int srcX = minX; srcX < maxX; srcX++) {
+                            if (srcX < 0 || srcX >= sourceWidth) {
+                                continue;
+                            }
+                            double xCoverage = pixelCoverage(srcX, srcX0, srcX1);
+                            double weight = xCoverage * yCoverage;
+                            if (weight <= 0.0) {
+                                continue;
+                            }
+
+                            int argb = sourcePixels[sourceRow + srcX];
+                            int alpha = (argb >>> 24) & 0xFF;
+                            int red = (argb >>> 16) & 0xFF;
+                            int green = (argb >>> 8) & 0xFF;
+                            int blue = argb & 0xFF;
+
+                            weightSum += weight;
+                            alphaSum += alpha * weight;
+                            redSum += red * weight;
+                            greenSum += green * weight;
+                            blueSum += blue * weight;
+                        }
+                    }
+
+                    if (weightSum <= 0.0) {
+                        outputPixels[outputRow + x] = 0xFF000000;
+                        continue;
+                    }
+
+                    int alpha = (int)Math.round(alphaSum / weightSum);
+                    int red = (int)Math.round(redSum / weightSum);
+                    int green = (int)Math.round(greenSum / weightSum);
+                    int blue = (int)Math.round(blueSum / weightSum);
+
+                    outputPixels[outputRow + x] =
+                        ((alpha & 0xFF) << 24)
+                            | ((red & 0xFF) << 16)
+                            | ((green & 0xFF) << 8)
+                            | (blue & 0xFF);
+                }
+            }
+
+            BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
+            output.setRGB(0, 0, targetWidth, targetHeight, outputPixels, 0, targetWidth);
+            return output;
+        }
+
+        private static double pixelCoverage(int pixelIndex, double min, double max) {
+            double pixelMin = pixelIndex;
+            double pixelMax = pixelIndex + 1.0;
+            return Math.max(0.0, Math.min(pixelMax, max) - Math.max(pixelMin, min));
         }
 
         private NativeImage[] detachCapturedFaces() {
@@ -1131,21 +1517,41 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
 
         private void positionPanoramaEntity(float yaw, float pitch) {
+            Vec3d captureOrigin = applyDirectionalNudge(origin, yaw, pitch, captureNudgeDistance);
             // `origin.y` is treated as camera eye Y; convert to entity base Y for vanilla camera math.
-            double entityY = origin.y - panoramaEntity.getStandingEyeHeight();
-            panoramaEntity.refreshPositionAndAngles(origin.x, entityY, origin.z, yaw, pitch);
+            double entityY = captureOrigin.y - panoramaEntity.getStandingEyeHeight();
+            panoramaEntity.refreshPositionAndAngles(captureOrigin.x, entityY, captureOrigin.z, yaw, pitch);
             panoramaEntity.setYaw(yaw);
             panoramaEntity.setPitch(pitch);
             panoramaEntity.lastYaw = yaw;
             panoramaEntity.lastPitch = pitch;
-            panoramaEntity.lastX = origin.x;
+            panoramaEntity.lastX = captureOrigin.x;
             panoramaEntity.lastY = entityY;
-            panoramaEntity.lastZ = origin.z;
+            panoramaEntity.lastZ = captureOrigin.z;
             panoramaEntity.setVelocity(Vec3d.ZERO);
             panoramaEntity.setHeadYaw(yaw);
             panoramaEntity.setBodyYaw(yaw);
             panoramaEntity.lastHeadYaw = yaw;
             panoramaEntity.lastBodyYaw = yaw;
+        }
+
+        private static Vec3d applyDirectionalNudge(Vec3d position, float yaw, float pitch, double distance) {
+            if (Math.abs(distance) <= NUDGE_EPSILON) {
+                return position;
+            }
+
+            Vec3d direction = directionFromYawPitch(yaw, pitch);
+            return position.add(direction.multiply(distance));
+        }
+
+        private static Vec3d directionFromYawPitch(float yaw, float pitch) {
+            double yawRadians = Math.toRadians(yaw);
+            double pitchRadians = Math.toRadians(pitch);
+            double pitchCos = Math.cos(pitchRadians);
+            double x = -Math.sin(yawRadians) * pitchCos;
+            double y = -Math.sin(pitchRadians);
+            double z = Math.cos(yawRadians) * pitchCos;
+            return new Vec3d(x, y, z);
         }
 
         private void stopInternal(MinecraftClient client, boolean notify, String reason) {
