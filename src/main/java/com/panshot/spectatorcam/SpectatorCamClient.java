@@ -286,13 +286,8 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 ))
                 .then(everyX);
 
-        LiteralArgumentBuilder<FabricClientCommandSource> panoramaStart = literal("start")
-            .executes(context -> PANORAMA_CONTROLLER.startAtPlayer(
-                context.getSource().getClient(),
-                DEFAULT_PANORAMA_INTERVAL_SECONDS
-            ))
-            .then(startX)
-            .then(literal("every").then(everyInterval));
+        LiteralArgumentBuilder<FabricClientCommandSource> panoramaEvery = literal("every")
+            .then(everyInterval);
 
         LiteralArgumentBuilder<FabricClientCommandSource> panoramaDownscale = literal("downscale")
             .executes(context -> PANORAMA_CONTROLLER.downscaleStatus(context.getSource().getClient()))
@@ -326,6 +321,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 .executes(context -> PANORAMA_CONTROLLER.setCaptureNudge(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "distance")
+                )));
+
+        LiteralArgumentBuilder<FabricClientCommandSource> panoramaResolutionCommand = literal("resolution")
+            .executes(context -> PANORAMA_CONTROLLER.resolutionStatus(context.getSource().getClient()))
+            .then(argument("size", IntegerArgumentType.integer(16, 8192))
+                .executes(context -> PANORAMA_CONTROLLER.setResolution(
+                    context.getSource().getClient(),
+                    IntegerArgumentType.getInteger(context, "size")
                 )));
 
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singlePitch =
@@ -416,7 +419,12 @@ public final class SpectatorCamClient implements ClientModInitializer {
             .then(literal("where").executes(context -> CAMERA_CONTROLLER.printPosition(context.getSource().getClient())))
             .then(singleCommand)
             .then(literal("panorama")
-                .then(panoramaStart)
+                .executes(context -> PANORAMA_CONTROLLER.startAtPlayer(
+                    context.getSource().getClient(),
+                    DEFAULT_PANORAMA_INTERVAL_SECONDS
+                ))
+                .then(startX)
+                .then(panoramaEvery)
                 .then(literal("stop").executes(context -> PANORAMA_CONTROLLER.stop(context.getSource().getClient(), true)))
                 .then(literal("status").executes(context -> PANORAMA_CONTROLLER.status(context.getSource().getClient())))
                 .then(literal("mode")
@@ -432,6 +440,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     .then(literal("on").executes(context -> PANORAMA_CONTROLLER.setExportEnabled(context.getSource().getClient(), true)))
                     .then(literal("off").executes(context -> PANORAMA_CONTROLLER.setExportEnabled(context.getSource().getClient(), false))))
                 .then(panoramaDownscale)
+                .then(panoramaResolutionCommand)
                 .then(panoramaNudge))
             .then(literal("tp")
                 .then(argument("x", DoubleArgumentType.doubleArg())
@@ -576,7 +585,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private static final UUID PANORAMA_PROFILE_ID = UUID.fromString("4f83f6ac-6349-4f15-9f9b-4a0e5c2623ad");
         private static final UUID PANORAMA_RENDER_PLAYER_PROFILE_ID = UUID.fromString("2a89a050-bf8c-4187-b2c3-f1f008f6422f");
         private static final int PANORAMA_RENDER_PLAYER_ENTITY_ID = Integer.MIN_VALUE + 42;
-        private static final int PANORAMA_RESOLUTION = 1024;
+        private static final int DEFAULT_PANORAMA_RESOLUTION = 1024;
         private static final int[] CUBEMAP_LAYOUT = {
             3, 1, 4,
             5, 0, 2
@@ -658,6 +667,8 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private volatile boolean preciseCaptureMode;
         private volatile boolean renderPlayerEnabled;
         private volatile double captureNudgeDistance;
+        private volatile int panoramaResolution = DEFAULT_PANORAMA_RESOLUTION;
+        private int cyclePanoramaResolution = DEFAULT_PANORAMA_RESOLUTION;
         private volatile double downscaleFactor = MIN_DOWNSCALE_FACTOR;
         private volatile DownscaleStage downscaleStage = DownscaleStage.CUBEMAP;
         private volatile DownscaleInterpolation downscaleInterpolation = DownscaleInterpolation.BICUBIC;
@@ -742,10 +753,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
             pendingFaceCaptures = 0;
             activeFaceIndex = -1;
             clearCapturedFaces();
+            cyclePanoramaResolution = panoramaResolution;
             nextCycleTick = tickCounter;
             cycleStartTick = tickCounter;
             ensurePanoramaEntity(client.world);
-            ensureFramebuffers(client);
+            ensureFramebuffers(client, cyclePanoramaResolution);
             vanillaMainFramebuffer = ((MinecraftClientAccessor)client).spectatorcam$getFramebuffer();
 
             try {
@@ -757,13 +769,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             send(client, String.format(
                 Locale.ROOT,
-                "Panorama capture started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, mode %s, downscale %s, nudge %s).",
+                "Panorama capture started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, resolution %s, mode %s, downscale %s, nudge %s).",
                 x,
                 y,
                 z,
                 intervalTicks / 20.0,
                 baseYaw,
                 basePitch,
+                describeActiveResolution(),
                 preciseCaptureMode ? "precise" : "smooth",
                 describeDownscale(),
                 describeCaptureNudge()
@@ -792,13 +805,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
             if (!preciseCaptureMode && cycleInProgress && activeFaceIndex >= 0) {
                 send(client, String.format(
                     Locale.ROOT,
-                    "Running: capturing face %d/6 at %.3f %.3f %.3f (yaw %.1f, pitch %.1f, mode %s, downscale %s, nudge %s).",
+                    "Running: capturing face %d/6 at %.3f %.3f %.3f (yaw %.1f, pitch %.1f, resolution %s, mode %s, downscale %s, nudge %s).",
                     activeFaceIndex + 1,
                     origin.x,
                     origin.y,
                     origin.z,
                     baseYaw,
                     basePitch,
+                    describeActiveResolution(),
                     preciseCaptureMode ? "precise" : "smooth",
                     describeDownscale(),
                     describeCaptureNudge()
@@ -809,13 +823,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
             double seconds = Math.max(0.0, (nextCycleTick - tickCounter) / 20.0);
             send(client, String.format(
                 Locale.ROOT,
-                "Running: next cycle in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, mode %s, downscale %s, nudge %s).",
+                "Running: next cycle in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, resolution %s, mode %s, downscale %s, nudge %s).",
                 seconds,
                 origin.x,
                 origin.y,
                 origin.z,
                 baseYaw,
                 basePitch,
+                describeActiveResolution(),
                 preciseCaptureMode ? "precise" : "smooth",
                 describeDownscale(),
                 describeCaptureNudge()
@@ -829,6 +844,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             facesScheduledInCycle = 0;
             pendingFaceCaptures = 0;
             activeFaceIndex = preciseCaptureMode ? -1 : 0;
+            cyclePanoramaResolution = panoramaResolution;
             clearCapturedFaces();
         }
 
@@ -912,6 +928,21 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return 1;
         }
 
+        private int resolutionStatus(MinecraftClient client) {
+            send(client, "Panorama resolution is " + describeConfiguredResolution() + ".");
+            return 1;
+        }
+
+        private int setResolution(MinecraftClient client, int size) {
+            panoramaResolution = size;
+            if (running) {
+                send(client, "Panorama resolution set to " + describeConfiguredResolution() + " (applies next cycle).");
+            } else {
+                send(client, "Panorama resolution set to " + describeConfiguredResolution() + ".");
+            }
+            return 1;
+        }
+
         private int downscaleStatus(MinecraftClient client) {
             send(client, "Panorama downscale is " + describeDownscale() + ".");
             return 1;
@@ -973,8 +1004,17 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return String.format(Locale.ROOT, "%+.4f blocks", nudge);
         }
 
+        private String describeConfiguredResolution() {
+            return panoramaResolution + "x" + panoramaResolution;
+        }
+
+        private String describeActiveResolution() {
+            return cyclePanoramaResolution + "x" + cyclePanoramaResolution;
+        }
+
         private RenderContext beginPanoramaRender(MinecraftClient client) {
-            ensureFramebuffers(client);
+            int faceResolution = cyclePanoramaResolution;
+            ensureFramebuffers(client, faceResolution);
 
             MinecraftClientAccessor clientAccessor = (MinecraftClientAccessor)client;
             Framebuffer currentFramebuffer = clientAccessor.spectatorcam$getFramebuffer();
@@ -998,10 +1038,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
             boolean renderPlayerAdded = false;
 
             try {
-                windowAccessor.spectatorcam$setWidth(PANORAMA_RESOLUTION);
-                windowAccessor.spectatorcam$setHeight(PANORAMA_RESOLUTION);
-                window.setFramebufferWidth(PANORAMA_RESOLUTION);
-                window.setFramebufferHeight(PANORAMA_RESOLUTION);
+                windowAccessor.spectatorcam$setWidth(faceResolution);
+                windowAccessor.spectatorcam$setHeight(faceResolution);
+                window.setFramebufferWidth(faceResolution);
+                window.setFramebufferHeight(faceResolution);
 
                 if (renderPlayerEnabled && client.player != null && client.world != null) {
                     removeEntityIfPresent(client.world, PANORAMA_RENDER_PLAYER_ENTITY_ID);
@@ -1222,9 +1262,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
             double factor = downscaleFactor;
             DownscaleStage stage = downscaleStage;
             DownscaleInterpolation interpolation = downscaleInterpolation;
-            int stitchedFaceSize = PANORAMA_RESOLUTION;
+            int sourceFaceSize = faces[0].getWidth();
+            int stitchedFaceSize = sourceFaceSize;
             if (factor > MIN_DOWNSCALE_FACTOR && stage == DownscaleStage.FACES) {
-                stitchedFaceSize = scaledDimension(PANORAMA_RESOLUTION, factor);
+                stitchedFaceSize = scaledDimension(sourceFaceSize, factor);
             }
 
             BufferedImage stitched = new BufferedImage(stitchedFaceSize * 3, stitchedFaceSize * 2, BufferedImage.TYPE_INT_ARGB);
@@ -1236,7 +1277,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                         BufferedImage face = toBufferedImage(faces[faceIndex]);
                         try {
                             BufferedImage sourceForDraw = face;
-                            if (stitchedFaceSize != PANORAMA_RESOLUTION) {
+                            if (stitchedFaceSize != sourceFaceSize) {
                                 sourceForDraw = resizeBufferedImage(face, stitchedFaceSize, stitchedFaceSize, interpolation);
                             }
                             try {
@@ -1505,14 +1546,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return panoramaRenderPlayerEntity;
         }
 
-        private void ensureFramebuffers(MinecraftClient client) {
+        private void ensureFramebuffers(MinecraftClient client, int resolution) {
             if (panoramaRenderFramebuffer == null
-                || panoramaRenderFramebuffer.textureWidth != PANORAMA_RESOLUTION
-                || panoramaRenderFramebuffer.textureHeight != PANORAMA_RESOLUTION) {
+                || panoramaRenderFramebuffer.textureWidth != resolution
+                || panoramaRenderFramebuffer.textureHeight != resolution) {
                 if (panoramaRenderFramebuffer != null) {
                     panoramaRenderFramebuffer.delete();
                 }
-                panoramaRenderFramebuffer = new SimpleFramebuffer("panshot-panorama", PANORAMA_RESOLUTION, PANORAMA_RESOLUTION, true);
+                panoramaRenderFramebuffer = new SimpleFramebuffer("panshot-panorama", resolution, resolution, true);
             }
         }
 

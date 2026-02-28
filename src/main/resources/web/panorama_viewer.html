@@ -113,6 +113,14 @@
     input[type="range"] {
       width: 170px;
     }
+    input[type="number"] {
+      width: 88px;
+      padding: 4px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+    }
     label {
       font-size: 13px;
       color: var(--muted);
@@ -153,6 +161,9 @@
   </div>
   <div class="row">
     <label><input id="flipToggle" type="checkbox"> Flip A/B</label>
+    <label><input id="autoFlipToggle" type="checkbox"> Auto flip</label>
+    <label>Ms</label>
+    <input id="autoFlipInterval" type="number" min="100" step="50" value="500">
     <span id="viewValue" class="hint">FOV: 90</span>
   </div>
   <div class="row">
@@ -189,6 +200,8 @@
   const blendSlider = document.getElementById("blend");
   const blendValue = document.getElementById("blendValue");
   const flipToggle = document.getElementById("flipToggle");
+  const autoFlipToggle = document.getElementById("autoFlipToggle");
+  const autoFlipIntervalInput = document.getElementById("autoFlipInterval");
   const rawToggle = document.getElementById("rawToggle");
   const statusEl = document.getElementById("status");
   const viewValue = document.getElementById("viewValue");
@@ -227,6 +240,7 @@
   let rawLastX = 0;
   let rawLastY = 0;
   let nearestPatchInstalled = false;
+  let autoFlipTimer = null;
 
   function installNearestTexturePatch() {
     if (nearestPatchInstalled) {
@@ -485,6 +499,25 @@
       customContainer.style.zIndex = "2";
       customContainer.style.opacity = String(alpha);
     }
+  }
+
+  function applyAutoFlip() {
+    if (autoFlipTimer !== null) {
+      clearInterval(autoFlipTimer);
+      autoFlipTimer = null;
+    }
+
+    if (!autoFlipToggle.checked) {
+      return;
+    }
+
+    const intervalMs = Math.max(100, Math.round(Number(autoFlipIntervalInput.value) || 500));
+    autoFlipIntervalInput.value = intervalMs;
+    autoFlipTimer = setInterval(() => {
+      flipToggle.checked = !flipToggle.checked;
+      applyViewerBlend();
+      drawRawAtlas();
+    }, intervalMs);
   }
 
   function setViewerAtlas(viewer, atlasCanvas, preserveView) {
@@ -756,6 +789,9 @@
     applyViewerBlend();
     drawRawAtlas();
   });
+
+  autoFlipToggle.addEventListener("change", applyAutoFlip);
+  autoFlipIntervalInput.addEventListener("change", applyAutoFlip);
 
   rawToggle.addEventListener("change", () => {
     rawZoom = 1;

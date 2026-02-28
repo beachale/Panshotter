@@ -11,13 +11,22 @@ Vibecoded, of course, but works fine. More features may come in the future.
 
 Usage
 
-/panshot panorama start every 5
+/panshot panorama every 5
 
 /panshot single every 5
 
 /panshot panorama downscale 2.0 cubemap bicubic
 
+/panshot panorama resolution 2048
+
 /panshot panorama nudge 0.05
+
+Panorama resolution syntax:
+
+/panshot panorama resolution <size>
+
+- `size`: square face size in pixels (`16` to `8192`), e.g. `512`, `1024`, `2048`.
+- Example supersample workflow: set `resolution 2048`, then `/panshot panorama downscale 2 faces supersample` to produce `1024x1024` faces from supersampled captures.
 
 Downscale syntax:
 
